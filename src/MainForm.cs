@@ -15,7 +15,8 @@ public sealed class MainForm : Form
     readonly System.Windows.Forms.Timer pulse = new() { Interval = 1000 };
     int tab; bool canExit, starting, attempted, seenGame, lifecycleBusy, released; long lostAt;
     string? message; DemoGame? demoGame;
-    Font? controlFont;
+    readonly Dictionary<int, Font> controlFonts = new();
+    bool layoutInProgress;
     float ScaleFactor => Math.Min(scene.Width / 1060f, scene.Height / 760f);
     bool Ended => Rules.Ended(store.State, publicKey);
     public MainForm(StateStore store, string publicKey, RuntimeOptions options)
@@ -60,7 +61,6 @@ public sealed class MainForm : Form
             if (options.Session && !Ended) Hide();
         };
         LayoutControls(); RefreshScene();
-        Disposed += (_, _) => controlFont?.Dispose();
         if (options.Session) { WindowState = FormWindowState.Minimized; ShowInTaskbar = false; }
     }
     Button AddButton(string text, Rectangle bounds, int view, Action action, bool accent = false)
@@ -72,19 +72,44 @@ public sealed class MainForm : Form
     }
     void LayoutControls()
     {
-        if (scene.Width <= 0 || scene.Height <= 0 || IsDisposed || released) return;
+        if (scene.Width <= 0 || scene.Height <= 0 || IsDisposed || released || layoutInProgress) return;
         float s = ScaleFactor;
-        var oldFont = controlFont;
-        controlFont = new Font("Microsoft YaHei UI", 14 * s, FontStyle.Regular, GraphicsUnit.Pixel);
-        foreach (var (c, r, view) in items)
+        int fontKey = Math.Max(1, (int)Math.Round(14 * s * 2));
+        if (!controlFonts.TryGetValue(fontKey, out var font))
         {
-            c.SetBounds((int)(r.X * s), (int)(r.Y * s), (int)(r.Width * s), (int)(r.Height * s));
-            c.Font = controlFont; c.Visible = view == -1 || view == tab;
+            font = new Font("Microsoft YaHei UI", fontKey / 2f, FontStyle.Regular, GraphicsUnit.Pixel);
+            controlFonts.Add(fontKey, font);
         }
-        oldFont?.Dispose();
+        // WinForms can retain an equal-valued Font rather than our new instance.
+        // Keep every assigned font alive until all child controls are disposed.
+        layoutInProgress = true; scene.SuspendLayout();
+        try
+        {
+            foreach (var (c, r, view) in items)
+            {
+                c.SetBounds((int)(r.X * s), (int)(r.Y * s), (int)(r.Width * s), (int)(r.Height * s));
+                c.Font = font; c.Visible = view == -1 || view == tab;
+            }
+        }
+        finally { scene.ResumeLayout(false); layoutInProgress = false; }
         scene.Invalidate();
     }
     void Switch(int view) { tab = view; LayoutControls(); RefreshScene(); }
+    internal void VerifyLayoutFontLifetime()
+    {
+        using var bitmap = new Bitmap(32, 32); using var graphics = Graphics.FromImage(bitmap);
+        for (int i = 0; i < 90; i++)
+        {
+            // Repeating the same size matters: WinForms can keep equal-valued fonts.
+            if (i % 6 == 0) ClientSize = i % 12 == 0 ? new Size(1200, 860) : new Size(1440, 1040);
+            Switch(i % 3);
+            foreach (var (control, _, _) in items)
+            {
+                if (control.Font.GetHeight(graphics) <= 0 || control.Font.SizeInPoints <= 0)
+                    throw new InvalidOperationException("Invalid font after repeated layout.");
+            }
+        }
+    }
     void ShowMain() { ShowInTaskbar = true; Show(); WindowState = FormWindowState.Normal; Activate(); }
     void OpenDemo()
     {
@@ -218,6 +243,16 @@ public sealed class MainForm : Form
         if (!canExit && !options.Demo && store.State.Committed && !Ended && e.CloseReason == CloseReason.UserClosing && Native.IsGameRunning(options.TestProcess))
         { e.Cancel = true; Hide(); tray.ShowBalloonTip(1500, "攒愿继续守护", "从托盘可重新打开。原神退出后，主程序会退出。", ToolTipIcon.Info); return; }
         ReleaseResources(); base.OnFormClosing(e);
+    }
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) ReleaseResources();
+        base.Dispose(disposing);
+        if (disposing)
+        {
+            foreach (var font in controlFonts.Values) font.Dispose();
+            controlFonts.Clear();
+        }
     }
     void ReleaseResources()
     {

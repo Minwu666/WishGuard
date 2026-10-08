@@ -20,6 +20,7 @@ public static class SelfTest
         void Reject(Action action) { bool rejected=false; try { action(); } catch { rejected=true; } Expect(rejected); }
         string data = Program.GetArg(args,"--data") ?? Path.Combine(Path.GetTempPath(),"WishGuardTest-"+Guid.NewGuid().ToString("N")); Directory.CreateDirectory(data);
         Check("600 pull boundary",()=>Expect(Rules.Pulls(95999,0)==599 && Rules.Pulls(96000,0)==600 && Rules.Pulls(80000,100)==600));
+        Check("UI fonts survive repeated same-size layout and view changes",()=>UiRegression.VerifyFontLifetime(data));
         Check("negative resources rejected",()=>Reject(()=>Rules.Pulls(-1,0)));
         Check("oversized resources rejected",()=>Reject(()=>Rules.Pulls(long.MaxValue,0)));
         Check("Chinese OCR whitespace",()=>Expect(WishText.IsWish("祈 愿 1 0 次")));

@@ -1,0 +1,32 @@
+# Local credentials, authority keys and user state must never be committed.
+.private/
+**/authority-public.txt
+*.pem
+*.pfx
+*.p12
+*.key
+*.wishpass
+state*.json
+initialized
+events.jsonl*
+issued.jsonl
+.env
+.env.*
+# Build output and private verification evidence
+**/bin/
+**/obj/
+artifacts/
+test-results*/
+screenshots/
+evidence/
+*.zip
+*.exe
+*.dll
+*.pdb
+**/__pycache__/
+*.pyc
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

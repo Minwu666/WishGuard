@@ -16,6 +16,8 @@ jobs:
           dotnet-version: 9.0.x
       - name: Build
         run: dotnet build src/WishGuard.csproj -c Release -o artifacts/app
+      - name: Build local lifecycle probe (does not register tasks)
+        run: dotnet build tests/LifecycleProbe/LifecycleProbe.csproj -c Release
       - name: Policy and persistence tests (OCR explicitly excluded)
         shell: pwsh
         run: |

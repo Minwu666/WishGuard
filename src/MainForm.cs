@@ -48,6 +48,7 @@ public sealed class MainForm : Form
         guard.Changed += RefreshScene; pulse.Tick += async (_, _) => { await CheckGame(); RefreshScene(); }; pulse.Start();
         Shown += async (_, _) =>
         {
+            store.Log("session_started", options.Session ? "游戏联动会话已启动" : "手动打开主界面");
             if (options.Demo) OpenDemo();
             if (store.Migrated) message = "旧计划已升级为 600 抽永久解除，旧的限时凭证已作废。";
             if (options.AutoStart && !store.State.Committed && !Ended) await Enroll();
@@ -160,9 +161,9 @@ public sealed class MainForm : Form
             }
             else
             {
-                if (guard.Running) guard.Stop("原神已退出，本地识别已经停止。");
+                if (guard.Running || guard.Phase == "尚未启用") guard.Stop("原神未运行，等待游戏启动；本地识别已停止。");
                 attempted = false;
-                if (seenGame && !options.Demo)
+                if ((seenGame || options.Session) && !options.Demo)
                 {
                     if (lostAt == 0) lostAt = guard.Now;
                     if (guard.Now - lostAt >= 6)

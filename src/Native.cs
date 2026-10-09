@@ -76,12 +76,10 @@ public static class Native
         foreach (var name in testProcess != null ? new[] { testProcess } : new[] { "YuanShen", "GenshinImpact" })
         {
             var matches = Process.GetProcessesByName(name);
-            bool any = false;
-            foreach (var p in matches)
-            {
-                try { if (!p.HasExited) any = true; } catch { }
-                finally { p.Dispose(); }
-            }
+            // The process-name snapshot is enough for lifecycle detection. HasExited
+            // can require additional access to an elevated game process and fail.
+            bool any = matches.Length > 0;
+            foreach (var p in matches) p.Dispose();
             if (any) return true;
         }
         return false;

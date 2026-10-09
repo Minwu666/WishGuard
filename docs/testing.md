@@ -18,6 +18,18 @@ GitHub Actions 在 Windows 上构建 .NET 客户端，并运行 `--self-test --s
 在装有简体中文 OCR 的本机，去掉 `--skip-ocr` 可增加真实 Windows OCR 引擎检查。
 测试返回非零退出码或报告 `passed: false` 视为失败。重复运行应使用新的测试数据目录。
 
+## 本机计划任务与启停检查
+
+`tests/LifecycleProbe` 使用独立密钥、状态目录和模拟游戏进程，创建并清理一份临时的当前用户计划任务。它检查 Windows 实际启动任务、连续两轮游戏启停、初始化时游戏已退出、永久解除与任务清理。此检查会暂时注册计划任务，只在本机明确运行，不纳入默认 CI。
+
+先构建客户端并在全新的目录运行 `--self-test`，再运行：
+
+```powershell
+dotnet run --project tests/LifecycleProbe -c Release -- artifacts/app artifacts/test-data artifacts/fresh-lifecycle-probe
+```
+
+第二个路径必须是本轮 `--self-test --data` 使用的目录，第三个路径必须尚不存在。测试不使用实际游戏，也不替用户重启或注销 Windows；登录触发仍需在下一次自然登录时确认。
+
 ## 不能据此保证的情况
 
 尚未全面验证所有卡池、确认弹窗、持续快速输入、多显示器、HDR/DPI、所有分辨率、独占全屏及未来游戏更新。

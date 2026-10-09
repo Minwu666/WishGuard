@@ -32,7 +32,11 @@ static class Program
             else { using var form = new MainForm(state, publicKey, options); Application.Run(form); }
             return 0;
         }
-        catch (Exception e) { if (!watch) MessageBox.Show("攒愿未能启动：" + e.Message, "启动失败"); return 1; }
+        catch (Exception e)
+        {
+            try { new StateStore(data).Log("startup_error", e.ToString()); } catch { }
+            if (!watch) MessageBox.Show("攒愿未能启动：" + e.Message, "启动失败"); return 1;
+        }
     }
     public static string? GetArg(string[] args, string name)
     { int i = Array.IndexOf(args, name); return i >= 0 && i + 1 < args.Length ? args[i + 1] : null; }

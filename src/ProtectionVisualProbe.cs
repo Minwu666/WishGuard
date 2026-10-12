@@ -1,9 +1,13 @@
 #if WISHGUARD_TESTS
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 namespace WishGuard;
 internal static class ProtectionVisualProbe
 {
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(nint window);
+
     public static int Run(string root)
     {
         if (Directory.Exists(root)) throw new IOException("Use a fresh test directory.");
@@ -12,12 +16,53 @@ internal static class ProtectionVisualProbe
         using var game = new DemoGame(); using var alternate = new Form { Text = "攒愿隔离测试", Size = new(400, 300) };
         var store = new StateStore(Path.Combine(root, "state")); store.State.Committed = true; store.Save();
         using var guard = new GuardController(store, "") { Strong = true, DemoHandle = game.Handle, CaptureForTest = Path.Combine(root,"footer.png") };
+        async Task RetainFailure(string name)
+        {
+            var scene = new
+            {
+                name,
+                foreground = (long)Native.GetForegroundWindow(),
+                foregroundProcess = Native.ProcessName(Native.GetForegroundWindow()),
+                gameHandle = (long)game.Handle,
+                gameVisible = game.Visible,
+                gameNativeVisible = IsWindowVisible(game.Handle),
+                gameWindowState = game.WindowState.ToString(),
+                alternateHandle = alternate.IsHandleCreated ? (long)alternate.Handle : 0,
+                alternateVisible = alternate.Visible,
+                alternateNativeVisible = alternate.IsHandleCreated && IsWindowVisible(alternate.Handle),
+                alternateWindowState = alternate.WindowState.ToString(),
+                coverVisible = guard.CoverVisibleForTest,
+                coverHandle = (long)guard.CoverHandleForTest,
+                coverNativeVisible = guard.CoverHandleForTest != 0 && IsWindowVisible(guard.CoverHandleForTest),
+                guard.Phase,
+                guard.DebugForTest
+            };
+            File.WriteAllText(Path.Combine(root, "focus-failure.json"), JsonSerializer.Serialize(scene, new JsonSerializerOptions { WriteIndented = true }));
+            // Leave the failing synthetic scene unchanged briefly for observation.
+            await Task.Delay(20000);
+        }
         async Task Check(string name, Func<bool> condition, int ms = 10000)
         {
             var watch = Stopwatch.StartNew();
             while (!condition() && watch.ElapsedMilliseconds < ms) await Task.Delay(50);
             bool pass = condition(); results.Add(new { name, pass, milliseconds = watch.ElapsedMilliseconds, guard.Phase, guard.DebugForTest });
-            if (!pass) throw new Exception(name + ": " + guard.Status);
+            if (!pass) { await RetainFailure(name); throw new Exception(name + ": " + guard.Status); }
+        }
+        async Task Hold(string name, Func<bool> condition, int ms = 2500)
+        {
+            var watch = Stopwatch.StartNew();
+            while (watch.ElapsedMilliseconds < ms)
+            {
+                if (!condition())
+                {
+                    results.Add(new { name, pass = false, milliseconds = watch.ElapsedMilliseconds, guard.Phase, guard.DebugForTest });
+                    await RetainFailure(name);
+                    throw new Exception(name + ": " + guard.Status);
+                }
+                await Task.Delay(50);
+            }
+            bool pass = condition(); results.Add(new { name, pass, milliseconds = watch.ElapsedMilliseconds, guard.Phase, guard.DebugForTest });
+            if (!pass) { await RetainFailure(name); throw new Exception(name + ": " + guard.Status); }
         }
         game.Shown += async (_, _) =>
         {
@@ -38,6 +83,14 @@ internal static class ProtectionVisualProbe
                 await Check("foreground game entry shortcut is available", () => guard.ShortcutRegisteredForTest);
                 await Task.Delay(1000);
                 await Check("normal foreground remains clear after focus handoff", () => !guard.CoverVisibleForTest && Native.GetForegroundWindow() == game.Handle);
+                alternate.Show(); alternate.Activate();
+                await Check("normal play allows another window to take focus", () => !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle && !guard.ShortcutRegisteredForTest);
+                await Hold("normal play does not reclaim another window's focus", () => !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle && !guard.ShortcutRegisteredForTest, 3500);
+                game.WindowState = FormWindowState.Minimized; alternate.Activate();
+                await Check("minimizing normal play conceals cover", () => game.WindowState == FormWindowState.Minimized && !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle);
+                await Hold("normal play stays minimized without reclaiming focus", () => game.WindowState == FormWindowState.Minimized && !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle);
+                game.WindowState = FormWindowState.Normal; game.Activate();
+                await Check("restoring normal play releases the confirmation cover", () => !guard.CoverVisibleForTest && guard.Phase == "守护中" && Native.GetForegroundWindow() == game.Handle, 15000);
                 bool shortcut = true; guard.ShortcutForTest = () => shortcut;
                 await Check("entry indication covers before wish scene renders", () => guard.CoverVisibleForTest, 150);
                 shortcut = false; await Task.Delay(350);
@@ -54,12 +107,14 @@ internal static class ProtectionVisualProbe
                 }
                 await Check("repeated game activation retains usable protection", () => guard.CoverVisibleForTest && guard.EnforcementHealthy);
                 alternate.Show(); alternate.Activate();
-                await Check("other windows remain accessible", () => !guard.CoverVisibleForTest);
+                await Check("other windows remain accessible", () => !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle);
                 await Check("other applications retain their shortcuts", () => !guard.ShortcutRegisteredForTest);
+                await Hold("switching away from wish keeps the other window accessible", () => !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle && !guard.ShortcutRegisteredForTest);
                 game.Activate();
                 await Check("returning wish scene is covered without waiting for OCR", () => guard.CoverVisibleForTest, 800);
                 game.WindowState = FormWindowState.Minimized; alternate.Activate();
-                await Check("minimizing conceals cover", () => !guard.CoverVisibleForTest);
+                await Check("minimizing conceals cover", () => !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle);
+                await Hold("wish stays minimized without showing cover or reclaiming focus", () => game.WindowState == FormWindowState.Minimized && !guard.CoverVisibleForTest && Native.GetForegroundWindow() == alternate.Handle);
                 game.WindowState = FormWindowState.Normal; game.Activate();
                 await Check("restoring wish scene retains protection", () => guard.CoverVisibleForTest && guard.WishSeenForTest, 800);
                 game.ShowWishForTest(false);

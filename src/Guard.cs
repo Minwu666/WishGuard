@@ -66,7 +66,7 @@ public sealed class Shield : Form
         }
         if (!Visible) Show(); Native.Raise(Handle); if (!Passive) Native.FocusCover(Handle, game);
     }
-    public void Conceal() => Hide();
+    public void Conceal() { if (Visible) Hide(); }
     protected override void OnFormClosing(FormClosingEventArgs e)
     { if (e.CloseReason == CloseReason.UserClosing) e.Cancel = true; base.OnFormClosing(e); }
 }
@@ -98,6 +98,7 @@ public sealed class GuardController : IDisposable
     public void UseInputBroker(EnforcementProfile profile) { shield.Passive = true; inputBroker = new(profile); }
 #if WISHGUARD_TESTS
     internal bool CoverVisibleForTest => shield.Visible;
+    internal nint CoverHandleForTest => shield.IsHandleCreated ? shield.Handle : 0;
     internal bool WishSeenForTest => gate.WishSeen;
     internal string DebugForTest => $"gate={gate.Blocked},version={gate.Version},exclude={shield.CaptureExclusion},fg={Native.GetForegroundWindow()},game={DemoHandle},text={testText}";
     string testText = "";
@@ -233,7 +234,17 @@ public sealed class GuardController : IDisposable
     void RestoreGame(nint game)
     {
         returningToGame = true;
-        try { lastForeground = game; shield.Conceal(); Native.SetForegroundWindow(game); }
+        try
+        {
+            // Passive covers never own focus. Reasserting the game on every OCR
+            // refresh can interrupt an in-progress desktop or application switch.
+            nint foreground = Native.GetForegroundWindow();
+            // Windows can still report a hidden active cover as foreground.
+            bool returnFocus = !shield.Passive && (foreground == shield.Handle || shield.Visible && foreground == game);
+            shield.Conceal();
+            if (returnFocus) Native.SetForegroundWindow(game);
+            lastForeground = Native.GetForegroundWindow();
+        }
         finally { returningToGame = false; }
     }
     public async Task Start()

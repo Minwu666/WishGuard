@@ -56,6 +56,7 @@ public static class SelfTest
         await CheckReadiness("disposal during handoff is reported immediately", ["focus-unavailable", "inactive"], "inactive", 1);
         Check("UI fonts survive repeated same-size layout and view changes",()=>UiRegression.VerifyFontLifetime(data));
         Check("first shown cover aligns without waiting for another frame",UiRegression.VerifyShieldInitialPlacement);
+        Check("resource preview is read-only, current and cleared between views",UiRegression.VerifyResourcePreview);
         Check("negative resources rejected",()=>Reject(()=>Rules.Pulls(-1,0)));
         Check("oversized resources rejected",()=>Reject(()=>Rules.Pulls(long.MaxValue,0)));
         Check("Chinese OCR whitespace",()=>Expect(WishText.IsWish("祈 愿 1 0 次")));

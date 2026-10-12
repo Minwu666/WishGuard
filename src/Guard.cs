@@ -8,6 +8,9 @@ public sealed class Shield : Form
     public string ResourceLine = "正在自动读取资源…";
     public bool Verifying;
     internal bool Passive;
+    Bitmap? resourcePreview;
+    Size previewFrameSize;
+    Rectangle previewSourceArea;
     protected override bool ShowWithoutActivation => Passive;
     protected override CreateParams CreateParams
     {
@@ -36,6 +39,15 @@ public sealed class Shield : Form
         float s = Math.Min(Width / 1200f, Height / 750f); float cx = Width / 2f, cy = Height / 2f;
         using var glow = new LinearGradientBrush(ClientRectangle, Color.FromArgb(20, 38, 55), BackColor, 60);
         g.FillRectangle(glow, ClientRectangle);
+        if (resourcePreview != null && previewFrameSize.Width > 0 && previewFrameSize.Height > 0)
+        {
+            float sx = ClientSize.Width / (float)previewFrameSize.Width, sy = ClientSize.Height / (float)previewFrameSize.Height;
+            var destination = new RectangleF(previewSourceArea.X * sx, previewSourceArea.Y * sy, previewSourceArea.Width * sx, previewSourceArea.Height * sy);
+            g.DrawImage(resourcePreview, destination, new RectangleF(0, 0, resourcePreview.Width, resourcePreview.Height), GraphicsUnit.Pixel);
+            using var captionFont = new Font("Microsoft YaHei UI", 12 * s, FontStyle.Regular, GraphicsUnit.Pixel);
+            using var captionInk = new SolidBrush(Color.FromArgb(174, 194, 209));
+            g.DrawString("顶部资源 · 实时画面", captionFont, captionInk, destination.Left, destination.Bottom + 7 * s);
+        }
         using var gold = new Pen(Color.FromArgb(219, 191, 138), 2 * s);
         g.DrawEllipse(gold, cx - 52 * s, cy - 195 * s, 104 * s, 104 * s);
         var star = new[] { new PointF(cx,cy-182*s),new PointF(cx+10*s,cy-153*s),new PointF(cx+37*s,cy-143*s),new PointF(cx+10*s,cy-133*s),new PointF(cx,cy-104*s),new PointF(cx-10*s,cy-133*s),new PointF(cx-37*s,cy-143*s),new PointF(cx-10*s,cy-153*s) };
@@ -56,6 +68,7 @@ public sealed class Shield : Form
         if (client.Width <= 0 || client.Height <= 0) return;
         if (Bounds != client)
         {
+            ClearResourcePreview();
             Bounds = client;
             var region = new Region(new Rectangle(Point.Empty, client.Size));
             region.Exclude(ReturnArea.Of(new Rectangle(Point.Empty, client.Size)));
@@ -63,7 +76,25 @@ public sealed class Shield : Form
         }
         if (!Visible) Show(); Native.Raise(Handle); if (!Passive) Native.FocusCover(Handle, game);
     }
-    public void Conceal() => Hide();
+    // Called on the UI thread with an already captured, confirmed wish frame.
+    // The crop stays in memory and does not add interactive holes to the cover.
+    public void ShowResourcePreview(Bitmap frame)
+    {
+        var area = ResourceReader.HeaderBounds(frame.Size);
+        if (area.Width <= 0 || area.Height <= 0) { ClearResourcePreview(); return; }
+        var next = ResourceReader.Crop(frame, area);
+        var previous = resourcePreview; resourcePreview = next;
+        previewFrameSize = frame.Size; previewSourceArea = area;
+        previous?.Dispose(); Invalidate();
+    }
+    public void ClearResourcePreview()
+    {
+        var previous = resourcePreview; resourcePreview = null;
+        previous?.Dispose(); if (previous != null) Invalidate();
+    }
+    public void Conceal() { Hide(); ClearResourcePreview(); }
+    protected override void Dispose(bool disposing)
+    { if (disposing) ClearResourcePreview(); base.Dispose(disposing); }
     protected override void OnFormClosing(FormClosingEventArgs e)
     { if (e.CloseReason == CloseReason.UserClosing) e.Cancel = true; base.OnFormClosing(e); }
 }
@@ -288,6 +319,7 @@ public sealed class GuardController : IDisposable
 #endif
             if (!Native.HasContent(footer))
             {
+                shield.ClearResourcePreview();
                 if (Strong && !gameplaySeen) { lastRecognition = uptime.ElapsedMilliseconds; Phase = "等待进入游戏"; Status = "启动画面加载中。"; return; }
                 if (Strong) { gate.Recheck(); UpdateFocus(); } Phase = "画面不可读"; Status = "截图近黑，无法可靠识别。请检查窗口化或无边框模式。"; misses = 0; return;
             }
@@ -315,7 +347,7 @@ public sealed class GuardController : IDisposable
             if (wish)
             {
                 if (latched != game.Handle) { store.Log("blocked", "识别到祈愿按钮"); nextResourceRead = 0; }
-                latched = game.Handle; misses = 0; shield.Verifying = false; shield.Place(game.Bounds, game.Handle); Phase = "祈愿已遮挡";
+                latched = game.Handle; misses = 0; shield.Verifying = false; shield.Place(game.Bounds, game.Handle); shield.ShowResourcePreview(frame); Phase = "祈愿已遮挡";
                 Status = !shield.CaptureExclusion ? "捕获排除不可用，自动恢复可能失效。" : shield.Passive ? "按 Esc 或点击游戏右上角 × 返回，正常游玩会自动恢复。" : Native.GetForegroundWindow() != shield.Handle ?
                     "遮挡未取得焦点，键盘可能仍传入游戏；请点击遮挡。" : "使用右上角游戏原有的 × 返回，正常游玩会自动恢复。";
                 Changed?.Invoke();
@@ -341,6 +373,7 @@ public sealed class GuardController : IDisposable
             }
             else if (Strong)
             {
+                shield.ClearResourcePreview();
                 if (!gameplaySeen && !CoverRequired)
                 {
                     if (shield.Visible) RestoreGame(game.Handle);
@@ -363,7 +396,7 @@ public sealed class GuardController : IDisposable
         catch (Exception e)
         {
             if (disposed || generation != epoch) return;
-            failed = true; gate.Recheck(); UpdateFocus(); Running = Ready = false; timer.Stop(); Phase = "保护不可用"; Status = "识别故障：" + e.Message;
+            shield.ClearResourcePreview(); failed = true; gate.Recheck(); UpdateFocus(); Running = Ready = false; timer.Stop(); Phase = "保护不可用"; Status = "识别故障：" + e.Message;
             store.Log("fault", e.GetType().Name);
         }
         finally { busy = false; if (!disposed) Changed?.Invoke(); }

@@ -6,6 +6,14 @@ public sealed record ResourceDetection(long? Primogems, long? Intertwined, strin
 { public bool Valid => Primogems != null && Intertwined != null; }
 public static class ResourceReader
 {
+    public static Rectangle HeaderBounds(Size frame)
+    {
+        if (frame.Width <= 0 || frame.Height <= 0) return Rectangle.Empty;
+        var area = Rectangle.FromLTRB(frame.Width - (int)(frame.Height * .43), 0,
+            frame.Width - (int)(frame.Height * .105), (int)(frame.Height * .095));
+        area.Intersect(new Rectangle(Point.Empty, frame));
+        return area;
+    }
     public static bool LimitedBanner(string text)
     {
         string s = Regex.Replace(text.Normalize(NormalizationForm.FormKC), @"\s", "");
@@ -88,7 +96,7 @@ public static class ResourceReader
     public static async Task<ResourceDetection> Read(Bitmap frame, OcrWorker worker)
     {
         int h = frame.Height, w = frame.Width;
-        using var header = Crop(frame, Rectangle.FromLTRB(w - (int)(h * .43), 0, w - (int)(h * .105), (int)(h * .095)), 3);
+        using var header = Crop(frame, HeaderBounds(frame.Size), 3);
         using var banner = Crop(frame, Rectangle.FromLTRB((int)(w * .10), (int)(h * .12), (int)(w * .47), (int)(h * .43)), 3);
         using var digits = LightText(header); using var label = LightText(banner);
         var raw = await worker.ReadResult(digits);

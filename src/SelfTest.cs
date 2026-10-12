@@ -56,7 +56,7 @@ public static class SelfTest
         await CheckReadiness("disposal during handoff is reported immediately", ["focus-unavailable", "inactive"], "inactive", 1);
         Check("UI fonts survive repeated same-size layout and view changes",()=>UiRegression.VerifyFontLifetime(data));
         Check("first shown cover aligns without waiting for another frame",UiRegression.VerifyShieldInitialPlacement);
-        Check("resource preview is read-only, current and cleared between views",UiRegression.VerifyResourcePreview);
+        Check("original resources stay visible while the lower wish area remains covered",UiRegression.VerifyResourceVisibility);
         Check("negative resources rejected",()=>Reject(()=>Rules.Pulls(-1,0)));
         Check("oversized resources rejected",()=>Reject(()=>Rules.Pulls(long.MaxValue,0)));
         Check("Chinese OCR whitespace",()=>Expect(WishText.IsWish("祈 愿 1 0 次")));
@@ -135,6 +135,9 @@ public static class SelfTest
             {
                 using var frame=new Bitmap(file);var r=await ResourceReader.Read(frame,worker);
                 Check("provided screenshot matches expected resource amounts",()=>Expect(r.Valid&&r.Primogems==long.Parse(Program.GetArg(args,"--expected-primogems")!)&&r.Intertwined==long.Parse(Program.GetArg(args,"--expected-intertwined")!)));
+                using var physical = ResourceReader.Crop(frame, new Rectangle(Point.Empty, frame.Size), 1920d / frame.Width);
+                var scaled = await ResourceReader.Read(physical, worker);
+                Check("provided screenshot resized to 1920 pixels matches expected resource amounts",()=>Expect(scaled.Valid&&scaled.Primogems==r.Primogems&&scaled.Intertwined==r.Intertwined));
                 results.Add(new{diagnostic="real screenshot resource result",r.Status,r.Primogems,r.Intertwined});
             }
         }

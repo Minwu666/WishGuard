@@ -111,12 +111,36 @@ public static class ResourceReader
         foreach (var range in new[] { (.12, .52), (.65, 1.0) })
         {
             var area = Rectangle.FromLTRB((int)(header.Width * range.Item1), 0, (int)(header.Width * range.Item2), header.Height);
-            using var part = Crop(header, area); using var prepared = LightText(part);
-            var read = await worker.ReadResult(prepared);
-            var numeric = read.Words.Select(w => w with { Text = w.Text is "O" or "o" or "〇" ? "0" : w.Text })
-                .Where(w => Regex.IsMatch(w.Text, @"^[0-9]{1,9}$") && w.Height >= 10).ToArray();
-            if (numeric.Length != 1) return result;
-            segmented.Add(numeric[0] with { X = numeric[0].X - 50 + area.X, Y = numeric[0].Y - 50 });
+            // Keep a clear amount from the full header. Re-reading that amount in
+            // isolation can make Windows OCR lose it, especially at display scaling.
+            // These separate columns exclude the circular plus button. Extra or
+            // clipped numbers make this frame ambiguous; only missing columns
+            // are read again, and the final layout checks still apply.
+            var retained = headerResult.Words.Where(w =>
+                Regex.IsMatch(w.Text.Normalize(NormalizationForm.FormKC), @"^[0-9]{1,9}$") && w.Height >= 10 &&
+                w.X < area.Right && w.X + w.Width > area.Left && w.Y < area.Bottom && w.Y + w.Height > area.Top).ToArray();
+            if (retained.Length > 1 || retained.Any(w => w.X < area.Left || w.X + w.Width > area.Right || w.Y < area.Top || w.Y + w.Height > area.Bottom)) return result;
+            if (retained.Length == 1) { segmented.Add(retained[0]); continue; }
+            using var part = Crop(header, area);
+            OcrWord? amount = null;
+            // A single zero is sensitive to OCR page segmentation. A second,
+            // wider margin recovers it without changing the original pixels.
+            foreach (int padding in new[] { 50, 100 })
+            {
+                using var prepared = LightText(part, padding);
+                var read = await worker.ReadResult(prepared);
+                var numeric = read.Words.Select(w => w with { Text = w.Text is "O" or "o" or "〇" ? "0" : w.Text })
+                    .Where(w => Regex.IsMatch(w.Text.Normalize(NormalizationForm.FormKC), @"^[0-9]{1,9}$") && w.Height >= 10).ToArray();
+                if (numeric.Length > 1) return result;
+                if (numeric.Length == 0) continue;
+                var number = numeric[0];
+                if (number.X < padding || number.Y < padding || number.X + number.Width > part.Width + padding ||
+                    number.Y + number.Height > part.Height + padding) return result;
+                amount = number with { X = number.X - padding + area.X, Y = number.Y - padding };
+                break;
+            }
+            if (amount == null) return result;
+            segmented.Add(amount);
         }
         return ParseHeader(new("", segmented.ToArray()), header, limited);
     }

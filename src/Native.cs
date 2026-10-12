@@ -12,6 +12,9 @@ public static class Native
     delegate bool EnumProc(nint hwnd, nint param);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc callback, nint param);
     [DllImport("user32.dll")] public static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+    // No keyboard hook, input injection or keystroke logging. Called only for the foreground game.
+    public static bool WishShortcutDown() => GetAsyncKeyState(0x72) < 0;
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(nint hwnd, out uint processId);
     [DllImport("user32.dll")] static extern bool GetClientRect(nint hwnd, out RECT rect);
     [DllImport("user32.dll")] static extern bool ClientToScreen(nint hwnd, ref POINT point);
@@ -21,12 +24,29 @@ public static class Native
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(nint process, uint flags, StringBuilder fileName, ref uint size);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint handle);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(nint handle);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    public static void FocusCover(nint cover, nint game)
+    {
+        nint foreground = GetForegroundWindow();
+        if (foreground == cover || game == 0 || foreground != game) return;
+        if (SetForegroundWindow(cover)) return;
+        if (GetForegroundWindow() != game) return;
+        uint own = GetCurrentThreadId(), target = GetWindowThreadProcessId(game, out _);
+        if (target == 0 || target == own || !AttachThreadInput(own, target, true)) return;
+        try { if (GetForegroundWindow() == game) SetForegroundWindow(cover); }
+        finally { AttachThreadInput(own, target, false); }
+    }
     [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(nint handle, uint affinity);
     [DllImport("user32.dll")] static extern bool SetWindowPos(nint hwnd, nint after, int x, int y, int cx, int cy, uint flags);
     public static void Raise(nint hwnd) => SetWindowPos(hwnd, new nint(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+    public delegate void WinEvent(nint hook, uint type, nint window, int objectId, int childId, uint thread, uint time);
+    [DllImport("user32.dll")] static extern nint SetWinEventHook(uint min, uint max, nint module, WinEvent callback, uint process, uint thread, uint flags);
+    [DllImport("user32.dll")] public static extern bool UnhookWinEvent(nint hook);
+    public static nint WatchForeground(WinEvent callback) => SetWinEventHook(3, 3, 0, callback, 0, 0, 0);
     public static Rectangle? BoundsOf(nint hwnd)
     {
-        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !GetClientRect(hwnd, out var r)) return null;
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !GetClientRect(hwnd, out var r) || r.Right <= 0 || r.Bottom <= 0) return null;
         var p = new POINT();
         return ClientToScreen(hwnd, ref p) ? new Rectangle(p.X, p.Y, r.Right, r.Bottom) : null;
     }

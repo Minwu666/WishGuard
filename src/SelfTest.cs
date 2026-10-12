@@ -20,7 +20,42 @@ public static class SelfTest
         void Reject(Action action) { bool rejected=false; try { action(); } catch { rejected=true; } Expect(rejected); }
         string data = Program.GetArg(args,"--data") ?? Path.Combine(Path.GetTempPath(),"WishGuardTest-"+Guid.NewGuid().ToString("N")); Directory.CreateDirectory(data);
         Check("600 pull boundary",()=>Expect(Rules.Pulls(95999,0)==599 && Rules.Pulls(96000,0)==600 && Rules.Pulls(80000,100)==600));
+        Check("new screen stays covered until repeated clear frames",()=> { var gate=new ScreenGate();Expect(gate.Blocked);gate.Observe(gate.Version,true,false);Expect(gate.Blocked);gate.Observe(gate.Version,true,false);Expect(!gate.Blocked); });
+        Check("wish detection covers immediately",()=> { var gate=new ScreenGate();gate.Observe(gate.Version,true,true);Expect(gate.Blocked&&gate.WishSeen); });
+        Check("switching away and returning preserves wish history",()=> { var gate=new ScreenGate();gate.Observe(gate.Version,true,true);gate.Recheck();Expect(gate.Blocked&&gate.WishSeen);gate.Observe(gate.Version,true,false);gate.Observe(gate.Version,true,false);Expect(gate.Blocked);gate.Observe(gate.Version,true,false);Expect(!gate.Blocked); });
+        Check("old asynchronous frames cannot remove new cover",()=> { var gate=new ScreenGate();int old=gate.Version;gate.Recheck();for(int i=0;i<5;i++)gate.Observe(old,true,false);Expect(gate.Blocked); });
+        Check("unreadable frame resets safe-frame count",()=> { var gate=new ScreenGate();gate.Observe(gate.Version,true,false);gate.Observe(gate.Version,false,false);gate.Observe(gate.Version,true,false);Expect(gate.Blocked); });
+        Check("entry transition cannot be cleared by earlier normal frames",()=> { var gate=new ScreenGate();int old=gate.Version;gate.HoldUntil(700);for(int i=0;i<4;i++){gate.Observe(old,true,false,800);gate.Observe(gate.Version,true,false,600);}Expect(gate.Blocked);gate.Observe(gate.Version,true,false,700);Expect(gate.Blocked);gate.Observe(gate.Version,true,false,701);Expect(!gate.Blocked); });
+        async Task CheckReadiness(string name, string[] statuses, string expected, int expectedWaits)
+        {
+            int waits = 0, repairs = 0;
+            string result = await ProtectionReadiness.Confirm(() => statuses[Math.Min(waits, statuses.Length - 1)], () => repairs++,
+                () => { waits++; return Task.CompletedTask; });
+            Check(name, () => Expect(result == expected && waits == expectedWaits && repairs == waits + 1));
+        }
+        await CheckReadiness("startup focus handoff recovers before reporting failure", ["focus-unavailable", "focus-unavailable", "focus-unavailable", "focus-unavailable", "ready"], "ready", 4);
+        await CheckReadiness("persistent focus failure remains a failure", ["focus-unavailable"], "focus-unavailable", 5);
+        await CheckReadiness("keyboard protection handshake settles", ["input-pending", "ready"], "ready", 1);
+        await CheckReadiness("persistent keyboard protection failure remains a failure", ["input-pending"], "input-pending", 5);
+        Check("Escape and desktop navigation remain available",()=>Expect(KeyboardPolicy.Allow(0x1B,false)&&KeyboardPolicy.Allow(0x5B,false)&&KeyboardPolicy.Allow(0x09,true)&&KeyboardPolicy.Allow(0x73,true)));
+        Check("covered game confirmation keys are blocked",()=>Expect(!KeyboardPolicy.Allow(0x0D,false)&&!KeyboardPolicy.Allow(0x20,false)&&!KeyboardPolicy.Allow(0x46,false)));
+        Check("releases reach game for keys held before cover",()=>Expect(KeyboardPolicy.Allow(0x57,false,false)&&KeyboardPolicy.Allow(0x26,false,false)));
+        Check("first slower wish load stays covered until scene confirmation",()=> {var gate=new ScreenGate();gate.HoldUntil(5000);foreach(long time in new long[]{800,1600,2400,3200})gate.Observe(gate.Version,true,false,time);Expect(gate.Blocked);gate.Observe(gate.Version,true,true,3500);Expect(gate.Blocked&&gate.WishSeen);});
+        Check("confirmed wish does not delay a subsequent return",()=> {var gate=new ScreenGate();gate.HoldUntil(5000);gate.Observe(gate.Version,true,true,1200);for(int i=0;i<3;i++)gate.Observe(gate.Version,true,false,1400+i);Expect(!gate.Blocked);});
+        Check("early return cancels entry wait only after new clear frames",()=> {var gate=new ScreenGate();gate.HoldUntil(5000);int old=gate.Version;gate.CancelHold();gate.Observe(old,true,false,300);Expect(gate.Blocked);gate.Observe(gate.Version,true,false,400);Expect(gate.Blocked);gate.Observe(gate.Version,true,false,500);Expect(!gate.Blocked);});
+        Check("return intent cannot clear a visible wish or unreadable scene",()=> {var gate=new ScreenGate();gate.HoldUntil(5000);gate.CancelHold();gate.Observe(gate.Version,true,true,300);Expect(gate.Blocked&&gate.WishSeen);gate.Observe(gate.Version,false,false,400);Expect(gate.Blocked);});
+        Check("protected policy replacement tolerates live shared readers",()=> {
+            string path=Path.Combine(data,"shared-profile.json");var profile=new EnforcementProfile();EnforcementPaths.Save(path,profile);
+            using var reader=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);
+            profile.Completed=true;EnforcementPaths.Save(path,profile);Expect(EnforcementPaths.Read(path).Completed);
+            Expect(!System.Text.Json.JsonSerializer.Deserialize<EnforcementProfile>(reader)!.Completed);
+        });
+        await CheckReadiness("persistent missing cover remains a failure", ["cover-unavailable"], "cover-unavailable", 5);
+        await CheckReadiness("window visibility and focus settle before health report", ["cover-unavailable", "focus-unavailable", "ready"], "ready", 2);
+        await CheckReadiness("recognition failure during handoff is reported immediately", ["focus-unavailable", "recognition-fault"], "recognition-fault", 1);
+        await CheckReadiness("disposal during handoff is reported immediately", ["focus-unavailable", "inactive"], "inactive", 1);
         Check("UI fonts survive repeated same-size layout and view changes",()=>UiRegression.VerifyFontLifetime(data));
+        Check("first shown cover aligns without waiting for another frame",UiRegression.VerifyShieldInitialPlacement);
         Check("negative resources rejected",()=>Reject(()=>Rules.Pulls(-1,0)));
         Check("oversized resources rejected",()=>Reject(()=>Rules.Pulls(long.MaxValue,0)));
         Check("Chinese OCR whitespace",()=>Expect(WishText.IsWish("祈 愿 1 0 次")));
@@ -28,6 +63,8 @@ public static class SelfTest
         Check("fullwidth digits",()=>Expect(WishText.IsWish("祈願１０次")));
         Check("ordinary mention ignored",()=>Expect(!WishText.IsWish("任务：前往祈愿之地")));
         Check("blank ignored",()=>Expect(!WishText.IsWish("")));
+        Check("startup loading text is not playable HUD",()=>Expect(!SceneText.HasGameHud("准备加载数据 45.29%")&&!SceneText.HasGameHud("点击进入")));
+        Check("game HUD accepts OCR spacing and common glyph errors",()=>Expect(SceneText.HasGameHud("U I D 000000000")&&SceneText.HasGameHud("U1D:000000000")&&SceneText.HasGameHud("引 D 000000000")));
         Check("limited banner confirmed",()=>Expect(ResourceReader.LimitedBanner("角 色 活 动 祈 愿")));
         Check("standard banner excluded",()=>Expect(!ResourceReader.LimitedBanner("常驻祈愿 奔行世间")));
         using var header = new Bitmap(1000,140); using var hg = Graphics.FromImage(header); hg.Clear(Color.DarkSlateBlue);

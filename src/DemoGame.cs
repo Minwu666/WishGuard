@@ -2,6 +2,19 @@ using System.Drawing.Drawing2D;
 namespace WishGuard;
 public sealed class DemoGame : Form
 {
+#if WISHGUARD_TESTS
+    internal void ShowWishForTest(bool value) { wish = value; Arrange(); }
+    internal bool WishForTest => wish;
+    internal int AttemptsForTest => attempts;
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Escape && wish) { wish = false; Arrange(); return true; }
+        if (keyData == Keys.Enter && wish) { attempts++; Invalidate(); return true; }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+    bool loadingForTest;
+    internal void ShowLoadingForTest(bool value) { loadingForTest = value; Arrange(); }
+#endif
     bool wish; readonly Button open = new(), close = new(), one = new(), ten = new(); int attempts;
     public DemoGame()
     {
@@ -16,6 +29,9 @@ public sealed class DemoGame : Form
     {
         int w = ClientSize.Width, h = ClientSize.Height;
         open.SetBounds(60, h / 2, 240, 54); open.Visible = !wish;
+#if WISHGUARD_TESTS
+        if (loadingForTest) open.Visible = false;
+#endif
         close.SetBounds(w - 75, 12, 58, 52); close.Visible = wish;
         one.SetBounds(w - 505, h - 82, 230, 56); ten.SetBounds(w - 255, h - 82, 230, 56); one.Visible = ten.Visible = wish;
         Invalidate();
@@ -24,8 +40,16 @@ public sealed class DemoGame : Form
     {
         base.OnPaint(e); var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
         int w = ClientSize.Width, h = ClientSize.Height;
+#if WISHGUARD_TESTS
+        if (loadingForTest)
+        {
+            ScenePanel.DrawText(g, "准备加载数据 45.29%", 350, h - 90, 26, Color.White);
+            return;
+        }
+#endif
         ScenePanel.DrawText(g, wish ? "模拟祈愿界面" : "普通游戏画面 · 模拟", 55, 125, 34, Color.White, true);
         ScenePanel.DrawText(g, $"这里只是测试画面，不会花费原石。\n\n模拟抽卡按钮收到点击：{attempts} 次", 58, h * .39f, 22, Color.White);
+        ScenePanel.DrawText(g, "UID 000000000", 24, h - 30, 16, Color.White);
         if (!wish) return;
         ScenePanel.Round(g, new(w - h*.37f, h*.025f, h*.17f, h*.043f), Color.FromArgb(57,77,100), 15);
         ScenePanel.Round(g, new(w - h*.185f, h*.025f, h*.083f, h*.043f), Color.FromArgb(57,77,100), 15);

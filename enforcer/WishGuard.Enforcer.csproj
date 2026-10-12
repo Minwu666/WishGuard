@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <Version>0.3.0</Version>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(WishGuardTestHooks)' == 'true'">
+    <DefineConstants>$(DefineConstants);WISHGUARD_TESTS</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../src/Policy.cs" Link="Policy.cs" />
+    <Compile Include="../src/EnforcementProtocol.cs" Link="EnforcementProtocol.cs" />
+    <Compile Include="../src/KeyboardPolicy.cs" Link="KeyboardPolicy.cs" />
+  </ItemGroup>
+</Project>

@@ -18,6 +18,13 @@ jobs:
         run: dotnet build src/WishGuard.csproj -c Release -o artifacts/app
       - name: Build local lifecycle probe (does not register tasks)
         run: dotnet build tests/LifecycleProbe/LifecycleProbe.csproj -c Release
+      - name: Build strong protection and isolated integration probes
+        run: |
+          dotnet build enforcer/WishGuard.Enforcer.csproj -c Release -o artifacts/enforcer
+          dotnet build src/WishGuard.csproj -c Release -p:WishGuardTestHooks=true -t:Rebuild -o artifacts/test-client
+          dotnet build tests/ProtectionProbe/ProtectionProbe.csproj -c Release -o artifacts/protection-probe
+      - name: Strong protection integration (simulated game only)
+        run: ./artifacts/protection-probe/ProtectionProbe.exe artifacts/test-client artifacts/enforcer test-results-protection
       - name: Policy and persistence tests (OCR explicitly excluded)
         shell: pwsh
         run: |

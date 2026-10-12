@@ -83,6 +83,7 @@ public sealed class WatcherContext : ApplicationContext
         try
         {
             var store = new StateStore(data);
+            if (!isolated && EnforcementPaths.Current() is { } enforcement) EnforcementPaths.Apply(store, enforcement);
             if (!store.Fault && (Rules.Ended(store.State, publicKey) || !store.State.Committed || !store.State.StartWithWindows))
             {
                 Lifecycle.Disable(data, isolated); store.Log("watcher_stopped", "计划已结束或未启用联动"); ExitThread(); return;

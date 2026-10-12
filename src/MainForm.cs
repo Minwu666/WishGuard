@@ -13,16 +13,26 @@ public sealed class MainForm : Form
     readonly CheckBox bindGame = new();
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer pulse = new() { Interval = 1000 };
+    readonly System.Windows.Forms.Timer protectionPulse = new() { Interval = 200 };
+    readonly EnforcementClient? enforcement;
+    bool protectionBusy;
+    string? lastProtectionStatus;
     int tab; bool canExit, starting, attempted, seenGame, lifecycleBusy, released; long lostAt;
     string? message; DemoGame? demoGame;
     readonly Dictionary<int, Font> controlFonts = new();
     bool layoutInProgress;
     float ScaleFactor => Math.Min(scene.Width / 1060f, scene.Height / 760f);
     bool Ended => Rules.Ended(store.State, publicKey);
-    public MainForm(StateStore store, string publicKey, RuntimeOptions options)
+    public MainForm(StateStore store, string publicKey, RuntimeOptions options, EnforcementProfile? profile = null)
     {
         this.store = store; this.publicKey = publicKey; this.options = options;
         guard = new(store, publicKey) { IgnoreRealGame = options.Isolated && options.TestProcess != null }; Text = options.Demo ? "攒愿 · 模拟演示" : "攒愿 · 600 抽计划";
+        if (profile is { Completed: false } && !options.Isolated)
+        {
+            enforcement = new(profile); guard.Strong = true; guard.ProtectionAvailable(false);
+            guard.UseInputBroker(profile);
+            protectionPulse.Tick += async (_, _) => await CheckProtection(); protectionPulse.Start();
+        }
         BackColor = Color.FromArgb(14, 23, 36); Font = new Font("Microsoft YaHei UI", 10);
         var area = Screen.PrimaryScreen!.WorkingArea;
         ClientSize = new Size(Math.Min(1440, area.Width - 100), Math.Min(1040, area.Height - 100));
@@ -32,10 +42,10 @@ public sealed class MainForm : Form
         settings = AddButton("守护设置", new(22, 204, 158, 44), -1, () => Switch(1));
         help = AddButton("识别与帮助", new(22, 262, 158, 44), -1, () => Switch(2));
         primary = AddButton("开启 600 抽守护", new(252, 595, 245, 46), 0, async () => { if (!store.State.Committed) await Enroll(); else ExportRequest(); }, true);
-        import = AddButton("导入永久解除凭证", new(518, 595, 239, 46), 0, ImportPass);
-        askRecovery = AddButton("申请 24 小时冷静期", new(252, 420, 235, 44), 1, RequestRecovery);
-        cancelRecovery = AddButton("撤销申请，继续守护", new(510, 420, 254, 44), 1, CancelRecovery);
-        finishRecovery = AddButton("冷静期已结束，停止守护", new(252, 481, 285, 44), 1, FinishRecovery, true);
+        import = AddButton("导入永久解除凭证", new(518, 595, 239, 46), 0, async () => await ImportPass());
+        askRecovery = AddButton("申请 24 小时冷静期", new(252, 420, 235, 44), 1, async () => await RequestRecovery());
+        cancelRecovery = AddButton("撤销申请，继续守护", new(510, 420, 254, 44), 1, async () => await CancelRecovery());
+        finishRecovery = AddButton("冷静期已结束，停止守护", new(252, 481, 285, 44), 1, async () => await FinishRecovery(), true);
         retry = AddButton("重新启动识别", new(252, 538, 220, 44), 2, async () => { attempted = false; await CheckGame(); });
         AddButton("打开使用说明", new(496, 538, 210, 44), 2, () => Process.Start(new ProcessStartInfo(Path.Combine(AppContext.BaseDirectory, "使用说明.md")) { UseShellExecute = true }));
         if (options.Demo) AddButton("模拟祈愿窗口", new(252, 709, 220, 38), 0, OpenDemo);
@@ -112,6 +122,36 @@ public sealed class MainForm : Form
         }
     }
     void ShowMain() { ShowInTaskbar = true; Show(); WindowState = FormWindowState.Normal; Activate(); }
+    async Task CheckProtection()
+    {
+        if (protectionBusy || released || enforcement == null || enforcement.Completed) return;
+        protectionBusy = true;
+        try
+        {
+            string status = await guard.ConfirmEnforcementStatus();
+            if (released) return;
+            if (status != lastProtectionStatus) { store.Log("protection_status", status); if (status != "ready") store.Log("protection_diagnostic", guard.EnforcementDiagnostic); lastProtectionStatus = status; }
+            var reply = await enforcement.Send("health", status == "ready");
+            if (released) return;
+            ApplyProtection(reply); guard.ProtectionAvailable(true);
+            if (message == "强制保护暂不可用，请恢复攒愿后再启动原神。") message = null;
+        }
+        catch (Exception)
+        {
+            if (!released) { guard.ProtectionAvailable(false); message = "强制保护暂不可用，请恢复攒愿后再启动原神。"; }
+        }
+        finally { protectionBusy = false; if (!released) RefreshScene(); }
+    }
+    void ApplyProtection(ProtectionReply reply)
+    {
+        var s = store.State;
+        bool changed = s.RecoveryAt != reply.RecoveryAt || s.RecoveryRequestedAt != reply.RecoveryRequestedAt ||
+            s.RecoveryFinished != reply.RecoveryFinished || s.PermanentPass != reply.PermanentPass;
+        s.RecoveryAt = reply.RecoveryAt; s.RecoveryRequestedAt = reply.RecoveryRequestedAt;
+        s.RecoveryFinished = reply.RecoveryFinished; s.PermanentPass = reply.PermanentPass;
+        if (changed) store.Save();
+        if (reply.Completed) { protectionPulse.Stop(); guard.Stop("计划已经结束。"); DisableWatcher(); }
+    }
     void OpenDemo()
     {
         if (!options.Demo) return;
@@ -210,33 +250,51 @@ public sealed class MainForm : Form
         }
         catch (Exception e) { message = e.Message; RefreshScene(); }
     }
-    void ImportPass()
+    async Task ImportPass()
     {
         using var dialog = new OpenFileDialog { Filter = "永久解除凭证 (*.wishpass)|*.wishpass" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         try
         {
             if (new FileInfo(dialog.FileName).Length > 16000) throw new InvalidDataException("文件不是有效凭证。");
-            guard.Import(File.ReadAllText(dialog.FileName)); DisableWatcher();
+            string token = File.ReadAllText(dialog.FileName);
+            if (enforcement != null) ApplyProtection(await enforcement.Send("unlock", token: token));
+            else guard.Import(token);
+            DisableWatcher();
             message = "600 抽计划完成。守护已永久解除，之后打开原神也不会再启动。";
         }
         catch (Exception e) { message = "未解除：" + e.Message; }
         RefreshScene();
     }
-    void RequestRecovery()
+    async Task RequestRecovery()
     {
-        try { Rules.RequestRecovery(store.State, guard.Now); store.Save(); message = "已开始 24 小时冷静期；期间仍继续守护。"; }
+        try
+        {
+            if (enforcement != null) ApplyProtection(await enforcement.Send("recover-request"));
+            else { Rules.RequestRecovery(store.State, guard.Now); store.Save(); }
+            message = "已开始 24 小时冷静期；期间仍继续守护。";
+        }
         catch (Exception e) { message = e.Message; } RefreshScene();
     }
-    void CancelRecovery()
+    async Task CancelRecovery()
     {
-        try { Rules.CancelRecovery(store.State); store.Save(); message = "已撤销提前结束申请，继续攒到 600 抽。"; }
+        try
+        {
+            if (enforcement != null) ApplyProtection(await enforcement.Send("recover-cancel"));
+            else { Rules.CancelRecovery(store.State); store.Save(); }
+            message = "已撤销提前结束申请，继续攒到 600 抽。";
+        }
         catch (Exception e) { message = e.Message; } RefreshScene();
     }
-    void FinishRecovery()
+    async Task FinishRecovery()
     {
         if (!Rules.CanFinishRecovery(store.State, guard.Now)) return;
-        try { store.State.RecoveryFinished = true; store.Save(); guard.Stop("冷静期结束，守护已停止。"); DisableWatcher(); message = "已结束守护和自动启动。"; }
+        try
+        {
+            if (enforcement != null) ApplyProtection(await enforcement.Send("recover-finish"));
+            else { store.State.RecoveryFinished = true; store.Save(); }
+            guard.Stop("冷静期结束，守护已停止。"); DisableWatcher(); message = "已结束守护和自动启动。";
+        }
         catch (Exception e) { message = e.Message; } RefreshScene();
     }
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -258,7 +316,8 @@ public sealed class MainForm : Form
     void ReleaseResources()
     {
         if (released) return; released = true;
-        pulse.Stop(); pulse.Dispose(); guard.Dispose(); tray.Visible = false; tray.Dispose(); demoGame?.Dispose();
+        pulse.Stop(); pulse.Dispose(); protectionPulse.Stop(); protectionPulse.Dispose(); enforcement?.Dispose();
+        guard.Dispose(); tray.Visible = false; tray.Dispose(); demoGame?.Dispose();
     }
     void PaintScene(Graphics g)
     {
@@ -268,7 +327,7 @@ public sealed class MainForm : Form
         ScenePanel.Star(g, 42, 49, 16); ScenePanel.DrawText(g, "攒愿", 71, 30, 26, ScenePanel.White, true);
         ScenePanel.DrawText(g, "W I S H  G U A R D", 26, 86, 10, ScenePanel.Muted);
         ScenePanel.DrawText(g, "600 抽 · 永久解除", 25, 647, 13, ScenePanel.Gold);
-        ScenePanel.DrawText(g, options.Demo ? "模拟演示 / 不影响原神" : "本机识别 / 无需登录", 25, 674, 11, ScenePanel.Muted);
+        ScenePanel.DrawText(g, options.Demo ? "模拟演示 / 不影响原神" : enforcement != null ? "强制模式 / 本机识别" : "本机识别 / 无需登录", 25, 674, 11, ScenePanel.Muted);
         string title = tab == 0 ? "把期待，留给值得的相遇。" : tab == 1 ? "按自己的节奏，继续。" : "看得见的守护状态。";
         ScenePanel.DrawText(g, title, 234, 34, 29, ScenePanel.White, true);
         string phase = Ended ? "计划已结束" : !store.State.Committed ? "准备开始" : guard.Phase;
@@ -316,6 +375,7 @@ public sealed class MainForm : Form
         ScenePanel.DrawText(g, "改变主意可以随时撤销申请；再次申请时重新计算完整的 24 小时。", 252, 391, 12, ScenePanel.Muted);
         ScenePanel.DrawText(g, "关闭游戏或重启电脑，都不会清空已经保存的冷静期。", 252, 591, 13, ScenePanel.Muted);
         ScenePanel.DrawText(g, "600 抽达标核验属于永久解除，不需要再等待这段冷静期。", 252, 624, 13, ScenePanel.Muted);
+        if (enforcement != null) ScenePanel.DrawText(g, "强制模式：保护中断或失效时，原神会退出；恢复保护后再继续。", 252, 662, 13, ScenePanel.Warn);
     }
     void PaintHelp(Graphics g)
     {

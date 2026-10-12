@@ -92,6 +92,7 @@ public sealed class GuardController : IDisposable
     bool inputCountersSeen;
     long lastRecognition;
     long entryBlockedUntil;
+    long lastMinimize = -1000;
     long startedAt;
     bool CoverRequired => gate.Blocked && (gameplaySeen || gate.WishSeen || uptime.ElapsedMilliseconds < entryBlockedUntil);
     public bool Strong { get; set; }
@@ -195,6 +196,7 @@ public sealed class GuardController : IDisposable
             entryShortcut.Enable(inputBroker == null && target && Running && protectionAvailable);
             if (target && Native.BoundsOf(fg) is { Width: >= 640, Height: >= 360 } bounds)
             {
+                lastMinimize = -1000;
                 if (lastForeground != fg && lastForeground != shield.Handle) gate.Recheck();
                 bool shortcutDown = Native.WishShortcutDown();
 #if WISHGUARD_TESTS
@@ -207,7 +209,7 @@ public sealed class GuardController : IDisposable
             else if (fg != shield.Handle)
             {
                 if (lastForeground != fg) gate.Recheck();
-                shield.Conceal();
+                LeaveGame();
             }
             lastForeground = fg;
         }
@@ -216,6 +218,22 @@ public sealed class GuardController : IDisposable
             if (fg == latched && Native.BoundsOf(latched) is { } b) shield.Place(b, latched);
             else if (fg != shield.Handle) shield.Conceal();
         }
+    }
+    void LeaveGame(GameWindow? game = null)
+    {
+        if (Strong && armed && gameplaySeen && !IgnoreRealGame)
+        {
+            game ??= Native.GetGame(DemoHandle);
+            if (game != null)
+            {
+                if (uptime.ElapsedMilliseconds - lastMinimize >= 150 && Native.MinimizeInactiveGame(game.Handle, shield.Handle))
+                    lastMinimize = uptime.ElapsedMilliseconds;
+                // An asynchronous request is not proof the window has gone.
+                // Keep an existing cover until the game is actually hidden or minimized.
+                if (shield.Visible && Native.BoundsOf(game.Handle) != null) return;
+            }
+        }
+        shield.Conceal();
     }
     void HoldWishEntry()
     {
@@ -289,7 +307,7 @@ public sealed class GuardController : IDisposable
             { store.State.LastSeen = Math.Max(store.State.LastSeen, Now); store.Save(); lastSave = Now; }
             var game = IgnoreRealGame ? null : Native.GetGame(DemoHandle); nint fg = Native.GetForegroundWindow();
             if (game == null) { shield.Conceal(); consensus.Reset(); Phase = "等待游戏画面"; Status = "原神窗口未显示，暂不截图。"; return; }
-            if (fg != game.Handle && fg != shield.Handle) { shield.Conceal(); Phase = "守护待命"; Status = "已切换到其他应用，暂不截图。"; return; }
+            if (fg != game.Handle && fg != shield.Handle) { LeaveGame(game); Phase = "守护待命"; Status = "已切换到其他应用，暂不截图。"; return; }
             if (latched != 0 && latched != game.Handle) { latched = 0; misses = 0; consensus.Reset(); }
             if (Strong) UpdateFocus();
             if (latched == game.Handle || Strong && CoverRequired) shield.Place(game.Bounds, game.Handle);
@@ -321,7 +339,7 @@ public sealed class GuardController : IDisposable
             if (Strong && viewVersion != gate.Version) return;
             lastRecognition = uptime.ElapsedMilliseconds;
             fg = Native.GetForegroundWindow(); var current = Native.GetGame(DemoHandle);
-            if (current?.Handle != game.Handle || current.Bounds != game.Bounds || (fg != game.Handle && fg != shield.Handle)) { shield.Conceal(); return; }
+            if (current?.Handle != game.Handle || current.Bounds != game.Bounds || (fg != game.Handle && fg != shield.Handle)) { LeaveGame(current); return; }
             bool wish = WishText.IsWish(text);
             if (Strong && !gameplaySeen && (wish || SceneText.HasGameHud(text)))
             { gameplaySeen = true; store.Log("gameplay_ready", "已进入游戏画面"); }

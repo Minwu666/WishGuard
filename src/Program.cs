@@ -12,6 +12,7 @@ static class Program
         if (GetArg(args, "--visual-probe") is { } visual) return ProtectionVisualProbe.Run(visual);
         if (GetArg(args, "--return-demo") is { } demoControl) return ReturnProbe.Demo(demoControl);
         if (GetArg(args, "--return-probe") is { } returns) return ReturnProbe.Run(returns, GetArg(args,"--enforcer")!);
+        if (GetArg(args, "--background-probe") is { } background) return BackgroundProbe.Run(background, GetArg(args,"--enforcer")!);
         if (GetArg(args, "--pointer-demo") is { } pointerDemo) return PointerProbe.Demo(pointerDemo);
         if (GetArg(args, "--pointer-probe") is { } pointers) return PointerProbe.Run(pointers, GetArg(args,"--enforcer")!);
 #endif

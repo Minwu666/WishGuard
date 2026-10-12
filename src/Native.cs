@@ -20,6 +20,15 @@ public static class Native
     [DllImport("user32.dll")] static extern bool ClientToScreen(nint hwnd, ref POINT point);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(nint hwnd);
     [DllImport("user32.dll")] static extern bool IsIconic(nint hwnd);
+    [DllImport("user32.dll")] static extern bool ShowWindowAsync(nint hwnd, int command);
+    public static bool MinimizeInactiveGame(nint game, nint cover)
+    {
+        nint foreground = GetForegroundWindow();
+        if (game == 0 || foreground == 0 || foreground == game || foreground == cover || BoundsOf(game) == null) return false;
+        if (ProcessName(foreground) is "YuanShen" or "GenshinImpact") return false;
+        // Post to the game's UI thread; never wait on it or reactivate it.
+        return ShowWindowAsync(game, 6);
+    }
     [DllImport("kernel32.dll")] static extern nint OpenProcess(uint access, bool inherit, uint id);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(nint process, uint flags, StringBuilder fileName, ref uint size);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(nint handle);

@@ -1,5 +1,6 @@
 #if WISHGUARD_TESTS
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 namespace WishGuard;
@@ -8,11 +9,42 @@ namespace WishGuard;
 // to this fake game; no input is synthesized by the test or the application.
 internal static class ReturnProbe
 {
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool AllowSetForegroundWindow(uint processId);
+
+    static void WriteDemoState(string path, object state)
+    {
+        string temporary = path + ".tmp";
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using (var output = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+                    JsonSerializer.Serialize(output, state);
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+                return;
+            }
+            catch (IOException) when (attempt < 2) { Thread.Sleep(5); }
+        }
+    }
+
     public static int Demo(string control)
     {
         using var game = new DemoGame(); game.ShowWishForTest(true);
         using var timer = new System.Windows.Forms.Timer { Interval = 100 };
         string? previous = null;
+        string foregroundToken = "", pauseToken = "";
+        bool foregroundGranted = false, paused = false;
+        int foregroundError = 0;
+        long pauseStarted = 0, pauseEnded = 0;
+        void SaveState() => WriteDemoState(control + ".state", new
+        {
+            Wish = game.WishForTest, Attempts = game.AttemptsForTest,
+            ForegroundToken = foregroundToken, ForegroundGranted = foregroundGranted,
+            ForegroundError = foregroundError, PauseToken = pauseToken,
+            Paused = paused, PauseStarted = pauseStarted, PauseEnded = pauseEnded
+        });
         timer.Tick += (_,_) => {
             try {
             string current = "";
@@ -21,8 +53,38 @@ internal static class ReturnProbe
                 using var file = new FileStream(control, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 using var reader = new StreamReader(file); current = reader.ReadToEnd();
             }
-            if(current != previous) { previous = current; if(current.StartsWith("wish"))game.ShowWishForTest(true); }
-            File.WriteAllText(control+".state",JsonSerializer.Serialize(new{Wish=game.WishForTest,Attempts=game.AttemptsForTest}));
+            if(current != previous)
+            {
+                previous = current;
+                if(current.StartsWith("wish"))game.ShowWishForTest(true);
+                else if(current.StartsWith("normal"))game.ShowWishForTest(false);
+                else
+                {
+                    var command = current.Split(':', 3);
+                    if (command.Length == 3 && (command[0] is "foreground" or "pause") &&
+                        uint.TryParse(command[1], out uint parent) && parent != 0 && Guid.TryParseExact(command[2], "N", out _))
+                    {
+                        foregroundToken = command[2]; foregroundError = 0;
+                        bool ownsForeground = Native.GetForegroundWindow() == game.Handle;
+                        foregroundGranted = ownsForeground && AllowSetForegroundWindow(parent);
+                        if (!foregroundGranted) foregroundError = ownsForeground ? Marshal.GetLastWin32Error() : -1;
+                        if (command[0] == "pause" && foregroundGranted)
+                        {
+                            pauseToken = command[2]; paused = true;
+                            pauseStarted = Environment.TickCount64; pauseEnded = 0;
+                            try
+                            {
+                                SaveState();
+                                // Deliberately stop this fake game's UI message loop;
+                                // the real cross-process ShowWindowAsync must queue.
+                                Thread.Sleep(500);
+                            }
+                            finally { paused = false; pauseEnded = Environment.TickCount64; }
+                        }
+                    }
+                }
+            }
+            SaveState();
             } catch(IOException) { /* The observer may be reading; retry next tick. */ }
         };
         timer.Start(); Application.Run(game); return 0;

@@ -16,6 +16,11 @@ public sealed class ScreenGate
         if (!readable) { Recheck(); return; }
         if (wish) { WishSeen = true; Blocked = true; cleanFrames = 0; holdUntil = 0; return; }
         if (now < holdUntil) return;
-        if (++cleanFrames >= (WishSeen ? 3 : 2)) { Blocked = false; WishSeen = false; }
+        if (++cleanFrames >= (WishSeen ? 3 : 2))
+        {
+            // Invalidate detections captured before this confirmed return.
+            if (Blocked || WishSeen) Version++;
+            Blocked = false; WishSeen = false;
+        }
     }
 }

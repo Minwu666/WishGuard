@@ -10,7 +10,7 @@ param(
     [string]$ReportPath
 )
 $ErrorActionPreference = 'Stop'
-$result = [ordered]@{ Success = $false; Version = '0.3.1'; PolicyPreserved = $false }
+$result = [ordered]@{ Success = $false; Version = '0.3.2'; PolicyPreserved = $false }
 $changed = $false; $oldTasks = @{}; $oldService = $null; $serviceChanged = $false
 function Is-MissingTask($record) {
     $error = $record.Exception
@@ -56,7 +56,7 @@ try {
     }
     $id = Get-Key $OwnerSid
     $accountRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) ('WishGuard\' + $id)
-    $programRoot = Join-Path $accountRoot ('0.3.1-' + [Guid]::NewGuid().ToString('N'))
+    $programRoot = Join-Path $accountRoot ('0.3.2-' + [Guid]::NewGuid().ToString('N'))
     $client = Join-Path $programRoot 'Client'
     $enforcer = Join-Path $programRoot 'Enforcer'
     $policyDir = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('WishGuard\Strong\' + $id)
@@ -126,7 +126,7 @@ try {
     foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='WishGuard.exe' OR Name='WishGuard.Enforcer.exe'" | Where-Object { $_.ExecutablePath -in $allowed })) {
         Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    $backup = Join-Path $InstallDirectory ('backup\before-0.3.1-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $backup = Join-Path $InstallDirectory ('backup\before-0.3.2-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
     foreach ($name in $clientFiles) { $path = Join-Path $InstallDirectory $name; if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination (Join-Path $backup $name) } }
     function Protect-Directory([string]$path) {

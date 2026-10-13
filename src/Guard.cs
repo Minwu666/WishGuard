@@ -74,10 +74,11 @@ public sealed class Shield : Form
 public sealed class GuardController : IDisposable
 {
     readonly StateStore store; readonly string publicKey;
-    OcrWorker? ocr;
+    OcrWorker? ocr, fastOcr, resourceOcr;
     readonly Shield shield = new();
     readonly ResourceConsensus consensus = new();
     readonly System.Windows.Forms.Timer timer = new() { Interval = 75 }, focus = new() { Interval = 70 };
+    readonly System.Windows.Forms.Timer fast = new() { Interval = 35 };
     readonly Stopwatch uptime = Stopwatch.StartNew();
     readonly long startWall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     long lastSave, nextResourceRead; int epoch;
@@ -88,6 +89,9 @@ public sealed class GuardController : IDisposable
     readonly WishEntryShortcut entryShortcut;
     InputBrokerClient? inputBroker;
     bool inputBusy;
+    bool fastBusy, resourceBusy, fastReady, resourceReady;
+    int fastAttempts, resourceAttempts;
+    long fastRetryAt, resourceRetryAt;
     long entrySerial, returnSerial;
     bool inputCountersSeen;
     long lastRecognition;
@@ -98,6 +102,7 @@ public sealed class GuardController : IDisposable
     public bool Strong { get; set; }
     public void UseInputBroker(EnforcementProfile profile) { shield.Passive = true; inputBroker = new(profile); }
 #if WISHGUARD_TESTS
+    internal bool PassiveCoverForTest { set => shield.Passive = value; }
     internal bool CoverVisibleForTest => shield.Visible;
     internal nint CoverHandleForTest => shield.IsHandleCreated ? shield.Handle : 0;
     internal bool WishSeenForTest => gate.WishSeen;
@@ -106,6 +111,15 @@ public sealed class GuardController : IDisposable
     internal string? CaptureForTest;
     internal Func<bool>? ShortcutForTest;
     internal bool ShortcutRegisteredForTest => entryShortcut.Registered;
+    internal bool FastReadyForTest => fastReady;
+    internal long FastReadCountForTest;
+    internal long FastWishCountForTest;
+    internal double LastFastMillisecondsForTest;
+    internal bool ResourceBusyForTest => resourceBusy;
+    internal int ResourceDelayForTest, SceneDelayForTest;
+    internal bool SceneDelayBusyForTest, DelayedSceneWasWishForTest;
+    internal string? SceneTextOverrideForTest;
+    internal long SceneReadCountForTest;
 #endif
     bool protectionAvailable = true;
     public void ProtectionAvailable(bool available)
@@ -159,6 +173,7 @@ public sealed class GuardController : IDisposable
     public GuardController(StateStore store, string publicKey)
     {
         this.store = store; this.publicKey = publicKey; timer.Tick += async (_, _) => await Tick();
+        fast.Tick += async (_, _) => await FastTick();
         entryShortcut = new(OnWishEntry);
         foregroundCallback = (_, _, _, _, _, _, _) => UpdateFocus();
         foregroundHook = Native.WatchForeground(foregroundCallback);
@@ -272,20 +287,24 @@ public sealed class GuardController : IDisposable
         shortcutWasDown = false; entryBlockedUntil = 0; focus.Interval = Strong ? 20 : 70; gate.Reset(); UpdateFocus();
         Phase = "正在准备"; Status = "启动本地识别引擎…"; Changed?.Invoke();
         int generation = ++epoch; var worker = new OcrWorker(); ocr?.Dispose(); ocr = worker;
+        fastAttempts = resourceAttempts = 1; fastRetryAt = resourceRetryAt = 0;
         try
         {
             await worker.Start();
             if (disposed || generation != epoch) return;
             if (!worker.Language.StartsWith("zh-Hans", StringComparison.OrdinalIgnoreCase)) throw new IOException("请先安装 Windows 简体中文 OCR 组件。");
             Running = Ready = true; timer.Start(); Phase = "守护中"; Status = "等待原神前台画面。"; Changed?.Invoke();
+            _ = PrepareAuxiliaryWorker(new OcrWorker(), generation, true);
+            _ = PrepareAuxiliaryWorker(new OcrWorker(), generation, false);
         }
         catch (Exception e) { worker.Dispose(); if (generation == epoch) { store.Log("recognition_start_error", e.GetType().Name + ": " + e.Message); failed = true; Ready = Running = false; Phase = "保护不可用"; Status = "本地识别启动失败，请在设置中重试。"; Changed?.Invoke(); } throw; }
     }
     public void Stop(string reason)
     {
-        epoch++; timer.Stop(); Running = Ready = armed = false; latched = 0; misses = 0; gate.Reset();
+        epoch++; timer.Stop(); fast.Stop(); fastReady = false; Running = Ready = armed = false; latched = 0; misses = 0; gate.Reset();
         entryShortcut.Enable(false);
-        shield.Conceal(); ocr?.Dispose(); ocr = null; consensus.Reset(); Phase = "等待原神"; Status = reason; Changed?.Invoke();
+        shield.Conceal(); ocr?.Dispose(); ocr = null; fastOcr?.Dispose(); fastOcr = null;
+        resourceOcr?.Dispose(); resourceOcr = null; resourceReady = false; consensus.Reset(); Phase = "等待原神"; Status = reason; Changed?.Invoke();
     }
     public void Import(string token)
     {
@@ -296,8 +315,130 @@ public sealed class GuardController : IDisposable
         Stop("600 抽目标已核验，守护已永久解除。"); Phase = "已永久解除";
         store.Log("permanent_unlock", "600 抽永久凭证已接受"); Changed?.Invoke();
     }
+    async Task PrepareAuxiliaryWorker(OcrWorker worker, int generation, bool quick)
+    {
+        if (quick) { fastOcr?.Dispose(); fastOcr = worker; }
+        else { resourceReady = false; resourceOcr?.Dispose(); resourceOcr = worker; }
+        try
+        {
+            await worker.Start();
+            if (disposed || generation != epoch || !Running) { worker.Dispose(); return; }
+            if (!worker.Language.StartsWith("zh-Hans", StringComparison.OrdinalIgnoreCase)) throw new IOException("简体中文 OCR 不可用。");
+            if (quick) { fastReady = true; fast.Start(); }
+            else resourceReady = true;
+        }
+        catch (Exception e)
+        {
+            worker.Dispose();
+            if (quick && ReferenceEquals(fastOcr, worker)) { fastOcr = null; fastReady = false; fastRetryAt = uptime.ElapsedMilliseconds + 5000; }
+            else if (!quick && ReferenceEquals(resourceOcr, worker)) { resourceOcr = null; resourceReady = false; resourceRetryAt = uptime.ElapsedMilliseconds + 5000; }
+            if (!disposed && generation == epoch) store.Log(quick ? "fast_recognition_unavailable" : "resource_recognition_unavailable", e.GetType().Name);
+        }
+    }
+    void RetryAuxiliaryWorkers()
+    {
+        if (!Running || disposed || !armed) return;
+        if (fastOcr == null && fastAttempts < 3 && uptime.ElapsedMilliseconds >= fastRetryAt)
+        { fastAttempts++; _ = PrepareAuxiliaryWorker(new OcrWorker(), epoch, true); }
+        if (resourceOcr == null && resourceAttempts < 3 && uptime.ElapsedMilliseconds >= resourceRetryAt)
+        { resourceAttempts++; _ = PrepareAuxiliaryWorker(new OcrWorker(), epoch, false); }
+    }
+    async Task FastTick()
+    {
+        if (disposed || !Running || !armed || !fastReady || fastBusy || fastOcr == null) return;
+        nint foreground = Native.GetForegroundWindow();
+        nint cover = shield.IsHandleCreated ? shield.Handle : 0;
+        nint game = cover != 0 && foreground == cover ? latched : foreground;
+        bool target = DemoHandle != 0 ? game == DemoHandle : !IgnoreRealGame && Native.ProcessName(game) is "YuanShen" or "GenshinImpact";
+        if (!target || Native.BoundsOf(game) is not { Width: >= 640, Height: >= 360 } bounds) return;
+        fastBusy = true; int generation = epoch, version = gate.Version; var worker = fastOcr;
+        var watch = Stopwatch.StartNew();
+        try
+        {
+            using var area = FastWishVision.Capture(bounds);
+            using var prepared = FastWishVision.Prepare(area);
+            string text = await worker.Read(prepared);
+            if (disposed || !Running || generation != epoch || version != gate.Version) return;
+            nint current = Native.GetForegroundWindow();
+            if ((current != game && current != shield.Handle) || Native.BoundsOf(game) != bounds) return;
+#if WISHGUARD_TESTS
+            FastReadCountForTest++; LastFastMillisecondsForTest = watch.Elapsed.TotalMilliseconds;
+#endif
+            if (!WishText.IsWish(text)) return;
+#if WISHGUARD_TESTS
+            FastWishCountForTest++;
+#endif
+            // Only positive visual evidence can take this path. It must make
+            // any ordinary scene OCR already in flight stale before showing.
+            if (!gate.WishSeen || latched != game)
+            {
+                gate.Recheck();
+                nextResourceRead = 0; store.Log("blocked", "识别到祈愿按钮");
+            }
+            gate.Observe(gate.Version, true, true, uptime.ElapsedMilliseconds);
+            gameplaySeen = true; latched = game; misses = 0; shield.Verifying = false;
+            shield.Place(bounds, game); Phase = "祈愿已遮挡";
+            Status = "按 Esc 或点击游戏右上角 × 返回，正常游玩会自动恢复。";
+            Changed?.Invoke();
+        }
+        catch (Exception e)
+        {
+            if (!disposed && generation == epoch)
+            {
+                fast.Stop(); fastReady = false;
+                if (ReferenceEquals(fastOcr, worker)) { worker.Dispose(); fastOcr = null; fastRetryAt = uptime.ElapsedMilliseconds + 5000; }
+                store.Log("fast_recognition_unavailable", e.GetType().Name);
+            }
+        }
+        finally { fastBusy = false; }
+    }
+    async Task ReadResources(Bitmap frame, GameWindow game, int generation, int version, long observedAt)
+    {
+        resourceBusy = true; var worker = resourceOcr;
+        try
+        {
+            if (worker == null || !resourceReady) return;
+#if WISHGUARD_TESTS
+            if (ResourceDelayForTest > 0) await Task.Delay(ResourceDelayForTest);
+#endif
+            var result = await ResourceReader.Read(frame, worker);
+            nint foreground = Native.GetForegroundWindow();
+            if (disposed || generation != epoch || !Running || latched != game.Handle ||
+                Strong && (version != gate.Version || !gate.WishSeen) || Native.BoundsOf(game.Handle) != game.Bounds ||
+                (foreground != game.Handle && foreground != shield.Handle)) return;
+            ResourceStatus = result.Status;
+            var snapshot = consensus.Observe(result, observedAt);
+            if (snapshot != null && !store.Fault)
+            {
+                bool changed = store.State.Resources?.Primogems != snapshot.Primogems || store.State.Resources?.Intertwined != snapshot.Intertwined;
+                store.State.Resources = snapshot;
+                if (changed || Now - lastSave >= 10) { store.Save(); lastSave = Now; }
+                ResourceStatus = "已连续两次确认资源数量";
+                shield.ResourceLine = $"当前 {snapshot.Pulls:N0} / 600 抽  ·  原石 {snapshot.Primogems:N0}  ·  纠缠之缘 {snapshot.Intertwined:N0}";
+            }
+            else if (store.Fault) { ResourceStatus = "守护记录不可用，资源读数暂不能保存"; shield.ResourceLine = ResourceStatus; }
+            else if (result.Valid)
+            {
+                ResourceStatus = "读到资源，等待第二次确认…";
+                shield.ResourceLine = $"原石 {result.Primogems:N0}  ·  纠缠之缘 {result.Intertwined:N0}  ·  等待再次确认";
+            }
+            else shield.ResourceLine = result.Status;
+            shield.Invalidate(); Changed?.Invoke();
+        }
+        catch (Exception e)
+        {
+            if (!disposed && generation == epoch)
+            {
+                if (ReferenceEquals(resourceOcr, worker)) { worker?.Dispose(); resourceOcr = null; resourceReady = false; resourceRetryAt = uptime.ElapsedMilliseconds + 5000; }
+                ResourceStatus = "资源识别暂不可用，祈愿遮挡继续运行";
+                store.Log("resource_recognition_error", e.GetType().Name); Changed?.Invoke();
+            }
+        }
+        finally { frame.Dispose(); resourceBusy = false; }
+    }
     async Task Tick()
     {
+        RetryAuxiliaryWorkers();
         if (busy || disposed || !Running || ocr == null) return;
         busy = true; int generation = epoch; var worker = ocr;
         try
@@ -332,15 +473,25 @@ public sealed class GuardController : IDisposable
                 text = await worker.Read(prepared);
             }
 #if WISHGUARD_TESTS
+            if (SceneTextOverrideForTest != null) text = SceneTextOverrideForTest;
             testText = text;
+            if (SceneDelayForTest > 0)
+            {
+                SceneDelayBusyForTest = true; DelayedSceneWasWishForTest = WishText.IsWish(text);
+                try { await Task.Delay(SceneDelayForTest); }
+                finally { SceneDelayBusyForTest = false; }
+            }
 #endif
             if (disposed || generation != epoch) return;
             LastMilliseconds = watch.Elapsed.TotalMilliseconds;
-            if (Strong && viewVersion != gate.Version) return;
+            if (viewVersion != gate.Version) return;
             lastRecognition = uptime.ElapsedMilliseconds;
             fg = Native.GetForegroundWindow(); var current = Native.GetGame(DemoHandle);
             if (current?.Handle != game.Handle || current.Bounds != game.Bounds || (fg != game.Handle && fg != shield.Handle)) { LeaveGame(current); return; }
             bool wish = WishText.IsWish(text);
+#if WISHGUARD_TESTS
+            SceneReadCountForTest++;
+#endif
             if (Strong && !gameplaySeen && (wish || SceneText.HasGameHud(text)))
             { gameplaySeen = true; store.Log("gameplay_ready", "已进入游戏画面"); }
             if (Strong) gate.Observe(viewVersion, protectionAvailable && !string.IsNullOrWhiteSpace(text), wish, uptime.ElapsedMilliseconds);
@@ -351,35 +502,11 @@ public sealed class GuardController : IDisposable
                 Status = !shield.CaptureExclusion ? "捕获排除不可用，自动恢复可能失效。" : shield.Passive ? "按 Esc 或点击游戏右上角 × 返回，正常游玩会自动恢复。" : Native.GetForegroundWindow() != shield.Handle ?
                     "遮挡未取得焦点，键盘可能仍传入游戏；请点击遮挡。" : "使用右上角游戏原有的 × 返回，正常游玩会自动恢复。";
                 Changed?.Invoke();
-                // The screenshot was taken BEFORE the shield. Resource OCR cannot delay blocking.
-                if (uptime.ElapsedMilliseconds >= nextResourceRead)
+                // Resource OCR has its own worker and never holds scene recognition.
+                if (resourceReady && !resourceBusy && uptime.ElapsedMilliseconds >= nextResourceRead)
                 {
                     nextResourceRead = uptime.ElapsedMilliseconds + 1600;
-                    var result = await ResourceReader.Read(frame, worker);
-                    if (disposed || generation != epoch) return;
-                    ResourceStatus = result.Status;
-                    var snapshot = consensus.Observe(result, observedAt);
-                    if (snapshot != null && !store.Fault)
-                    {
-                        bool changed = store.State.Resources?.Primogems != snapshot.Primogems || store.State.Resources?.Intertwined != snapshot.Intertwined;
-                        store.State.Resources = snapshot;
-                        if (changed || Now - lastSave >= 10) { store.Save(); lastSave = Now; }
-                        ResourceStatus = "已连续两次确认资源数量";
-                        shield.ResourceLine = $"当前 {snapshot.Pulls:N0} / 600 抽  ·  原石 {snapshot.Primogems:N0}  ·  纠缠之缘 {snapshot.Intertwined:N0}";
-                        shield.Invalidate();
-                    }
-                    else if (store.Fault)
-                    {
-                        ResourceStatus = "守护记录不可用，资源读数暂不能保存";
-                        shield.ResourceLine = ResourceStatus;
-                    }
-                    else if (result.Valid)
-                    {
-                        ResourceStatus = "读到资源，等待第二次确认…";
-                        shield.ResourceLine = $"原石 {result.Primogems:N0}  ·  纠缠之缘 {result.Intertwined:N0}  ·  等待再次确认";
-                    }
-                    else shield.ResourceLine = result.Status;
-                    shield.Invalidate();
+                    _ = ReadResources((Bitmap)frame.Clone(), game, generation, viewVersion, observedAt);
                 }
             }
             else if (Strong)
@@ -406,11 +533,13 @@ public sealed class GuardController : IDisposable
         catch (Exception e)
         {
             if (disposed || generation != epoch) return;
-            failed = true; gate.Recheck(); UpdateFocus(); Running = Ready = false; timer.Stop(); Phase = "保护不可用"; Status = "识别故障：" + e.Message;
+            failed = true; gate.Recheck(); UpdateFocus(); Running = Ready = false; timer.Stop(); fast.Stop(); fastReady = resourceReady = false;
+            fastOcr?.Dispose(); fastOcr = null; resourceOcr?.Dispose(); resourceOcr = null;
+            Phase = "保护不可用"; Status = "识别故障：" + e.Message;
             store.Log("fault", e.GetType().Name);
         }
         finally { busy = false; if (!disposed) Changed?.Invoke(); }
     }
     public void Dispose()
-    { disposed = true; epoch++; if (foregroundHook != 0) Native.UnhookWinEvent(foregroundHook); inputBroker?.Dispose(); entryShortcut.Dispose(); timer.Dispose(); focus.Dispose(); ocr?.Dispose(); shield.Conceal(); shield.Dispose(); }
+    { disposed = true; epoch++; if (foregroundHook != 0) Native.UnhookWinEvent(foregroundHook); inputBroker?.Dispose(); entryShortcut.Dispose(); timer.Dispose(); focus.Dispose(); fast.Dispose(); ocr?.Dispose(); fastOcr?.Dispose(); resourceOcr?.Dispose(); shield.Conceal(); shield.Dispose(); }
 }

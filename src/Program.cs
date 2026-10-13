@@ -10,6 +10,7 @@ static class Program
 #if WISHGUARD_TESTS
         if (GetArg(args, "--protection-probe") is { } probe) return ProtectionProbe.Run(probe, args).GetAwaiter().GetResult();
         if (GetArg(args, "--visual-probe") is { } visual) return ProtectionVisualProbe.Run(visual);
+        if (GetArg(args, "--fast-visual-probe") is { } fastVisual) return FastVisualProbe.Run(fastVisual);
         if (GetArg(args, "--return-demo") is { } demoControl) return ReturnProbe.Demo(demoControl);
         if (GetArg(args, "--return-probe") is { } returns) return ReturnProbe.Run(returns, GetArg(args,"--enforcer")!);
         if (GetArg(args, "--background-probe") is { } background) return BackgroundProbe.Run(background, GetArg(args,"--enforcer")!);
@@ -17,6 +18,7 @@ static class Program
         if (GetArg(args, "--pointer-probe") is { } pointers) return PointerProbe.Run(pointers, GetArg(args,"--enforcer")!);
 #endif
         if (GetArg(args, "--analyze-image") is { } image) return SelfTest.Analyze(image, GetArg(args, "--report")!).GetAwaiter().GetResult();
+        if (GetArg(args, "--analyze-fast-image") is { } fastImage) return FastWishVision.Analyze(fastImage, GetArg(args, "--report")!).GetAwaiter().GetResult();
         bool demo = args.Contains("--demo"), isolated = args.Contains("--isolated"), watch = args.Contains("--watch");
         var options = new RuntimeOptions(demo, isolated || demo, args.Contains("--session"), args.Contains("--no-watch") || demo, args.Contains("--autostart"),
             isolated ? GetArg(args, "--test-process") : null);

@@ -4,7 +4,7 @@
     <TargetFramework>net9.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
-    <Version>0.3.1</Version>
+    <Version>0.3.2</Version>
   </PropertyGroup>
   <PropertyGroup Condition="'$(WishGuardTestHooks)' == 'true'">
     <DefineConstants>$(DefineConstants);WISHGUARD_TESTS</DefineConstants>

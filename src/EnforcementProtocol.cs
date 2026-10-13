@@ -15,6 +15,7 @@ public sealed class EnforcementProfile
     public string EnforcerExecutable { get; set; } = "";
     public string PipeName { get; set; } = "";
     public string TaskName { get; set; } = "";
+    public string ServiceName { get; set; } = "";
     public string PublicKey { get; set; } = "";
     public string[] GamePaths { get; set; } = [];
     public Dictionary<string, string> ClientHashes { get; set; } = new();

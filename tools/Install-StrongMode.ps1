@@ -10,8 +10,8 @@ param(
     [string]$ReportPath
 )
 $ErrorActionPreference = 'Stop'
-$result = [ordered]@{ Success = $false; Version = '0.3.0'; PolicyPreserved = $false }
-$changed = $false; $oldTasks = @{}
+$result = [ordered]@{ Success = $false; Version = '0.3.1'; PolicyPreserved = $false }
+$changed = $false; $oldTasks = @{}; $oldService = $null; $serviceChanged = $false
 function Is-MissingTask($record) {
     $error = $record.Exception
     while ($error) { if ($error.HResult -eq -2147024894) { return $true }; $error = $error.InnerException }
@@ -23,6 +23,7 @@ try {
     if (!([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Run this installer through Windows administrator confirmation.'
     }
+    . (Join-Path $PSScriptRoot 'ServiceManagement.ps1')
     $owner = [Security.Principal.SecurityIdentifier]::new($OwnerSid)
     $null = $owner.Translate([Security.Principal.NTAccount])
     $BundleDirectory = [IO.Path]::GetFullPath($BundleDirectory).TrimEnd('\')
@@ -55,12 +56,13 @@ try {
     }
     $id = Get-Key $OwnerSid
     $accountRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) ('WishGuard\' + $id)
-    $programRoot = Join-Path $accountRoot ('0.3.0-' + [Guid]::NewGuid().ToString('N'))
+    $programRoot = Join-Path $accountRoot ('0.3.1-' + [Guid]::NewGuid().ToString('N'))
     $client = Join-Path $programRoot 'Client'
     $enforcer = Join-Path $programRoot 'Enforcer'
     $policyDir = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('WishGuard\Strong\' + $id)
     $policyFile = Join-Path $policyDir 'profile.json'
     $strongTask = 'WishGuard-Strong-' + $id
+    $protectionService = 'WishGuard-Protection-' + $id
     $inputTask = $strongTask + '-Input'
     $watchTask = 'WishGuard-' + (Get-Key ($OwnerSid + '|' + $DataDirectory.ToLowerInvariant()))
     $clientFiles = @('WishGuard.exe','WishGuard.dll','WishGuard.deps.json','WishGuard.runtimeconfig.json','ocr-worker.ps1','使用说明.md')
@@ -82,6 +84,14 @@ try {
         if ($oldPolicy.Completed -or $oldPolicy.OwnerSid -ne $OwnerSid -or $oldPolicy.Policy.InstallId -ne $state.InstallId -or $oldPolicy.PublicKey -ne $publicKey) { throw 'Existing protected plan cannot be replaced.' }
         $state = $oldPolicy.Policy
     }
+    $oldService = Get-WishGuardServiceSnapshot $protectionService
+    if ($oldService) {
+        if (!$oldPolicy -or $oldPolicy.ServiceName -ne $protectionService -or
+            $oldService.StartName -ne 'LocalSystem' -or $oldService.ServiceType -ne 'Own Process' -or
+            $oldService.PathName -cne ('"' + $oldPolicy.EnforcerExecutable + '" --service-profile "' + $policyFile + '"')) {
+            throw 'Existing protection service does not match the installed plan.'
+        }
+    }
     $service = New-Object -ComObject 'Schedule.Service'; $service.Connect(); $folder = $service.GetFolder('\')
     foreach ($item in @(@($strongTask,'WishGuard strong protection'),@($watchTask,'WishGuard game watcher'),@($inputTask,'WishGuard input compatibility'))) {
         try {
@@ -102,6 +112,7 @@ try {
     }
     # Only our existing task and exact executable locations are stopped, with the game already closed.
     $changed = $true
+    if ($oldService) { $serviceChanged = $true; Stop-WishGuardService $protectionService }
     foreach ($name in @($strongTask,$watchTask,$inputTask)) {
         try { $folder.GetTask($name).Stop(0) } catch { if (!(Is-MissingTask $_)) { throw } }
     }
@@ -115,7 +126,7 @@ try {
     foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='WishGuard.exe' OR Name='WishGuard.Enforcer.exe'" | Where-Object { $_.ExecutablePath -in $allowed })) {
         Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    $backup = Join-Path $InstallDirectory ('backup\before-0.3.0-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $backup = Join-Path $InstallDirectory ('backup\before-0.3.1-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
     foreach ($name in $clientFiles) { $path = Join-Path $InstallDirectory $name; if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination (Join-Path $backup $name) } }
     function Protect-Directory([string]$path) {
@@ -170,7 +181,7 @@ try {
     $profile = [ordered]@{
         OwnerSid=$OwnerSid; ClientDirectory=$client; DataDirectory=$DataDirectory;
         EnforcerExecutable=(Join-Path $enforcer 'WishGuard.Enforcer.exe'); PipeName=('WishGuard-Strong-' + $id);
-        TaskName=$strongTask; PublicKey=$publicKey; GamePaths=@($GamePath); ClientHashes=$hashes; Policy=$state; Completed=$false; TestOnly=$false
+        TaskName=$strongTask; ServiceName=$protectionService; PublicKey=$publicKey; GamePaths=@($GamePath); ClientHashes=$hashes; Policy=$state; Completed=$false; TestOnly=$false
     }
     [IO.File]::WriteAllText($policyFile, ($profile | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
     Protect-File $policyFile
@@ -189,15 +200,7 @@ try {
     $action.Arguments = '--watch --data "' + $DataDirectory + '"'; $action.WorkingDirectory = $client
     $watchSddl = 'D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + $OwnerSid + ')'
     $registeredWatch = $folder.RegisterTaskDefinition($watchTask,$watch,6,$OwnerSid,$null,3,$watchSddl)
-    $strong = New-TaskDefinition 'WishGuard strong protection'
-    $strong.RegistrationInfo.Description = '攒愿强制模式：保护不可用时退出已登记的原神；计划结束后移除。'
-    $strong.Principal.UserId = 'SYSTEM'; $strong.Principal.LogonType = 5; $strong.Principal.RunLevel = 1
-    $null = $strong.Triggers.Create(8)
-    $trigger = $strong.Triggers.Create(9); $trigger.UserId = $OwnerSid
-    $action = $strong.Actions.Create(0); $action.Path = $profile.EnforcerExecutable
-    $action.Arguments = '--profile "' + $policyFile + '"'; $action.WorkingDirectory = $enforcer
     $strongSddl = 'O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;' + $OwnerSid + ')'
-    $registeredStrong = $folder.RegisterTaskDefinition($strongTask,$strong,6,'SYSTEM',$null,5,$strongSddl)
     $input = New-TaskDefinition 'WishGuard input compatibility'
     $input.RegistrationInfo.Description = '攒愿窗口兼容组件；仅服务于当前用户已登记的游戏与攒愿窗口。'
     $input.Principal.UserId = $OwnerSid; $input.Principal.LogonType = 3; $input.Principal.RunLevel = 1
@@ -205,9 +208,15 @@ try {
     $action = $input.Actions.Create(0); $action.Path = $profile.EnforcerExecutable
     $action.Arguments = '--input-profile "' + $policyFile + '"'; $action.WorkingDirectory = $enforcer
     $registeredInput = $folder.RegisterTaskDefinition($inputTask,$input,6,$OwnerSid,$null,3,$strongSddl)
-    $null = $registeredInput.Run($null); $null = $registeredWatch.Run($null); $null = $registeredStrong.Run($null)
+    # The ordinary Windows service owns recovery; retire the previous SYSTEM task.
+    try { $folder.DeleteTask($strongTask,0) } catch { if (!(Is-MissingTask $_)) { throw } }
+    $serviceChanged = $true
+    $serviceCommand = '"' + $profile.EnforcerExecutable + '" --service-profile "' + $policyFile + '"'
+    Set-WishGuardService $protectionService $serviceCommand $OwnerSid
+    $null = $registeredInput.Run($null); $null = $registeredWatch.Run($null)
+    Start-WishGuardService $protectionService
     Start-Sleep -Seconds 3
-    if ($folder.GetTask($strongTask).State -ne 4 -or $folder.GetTask($watchTask).State -ne 4 -or $folder.GetTask($inputTask).State -ne 4) { throw 'Installed protection did not remain running.' }
+    if ((Get-WishGuardService $protectionService).State -ne 'Running' -or $folder.GetTask($watchTask).State -ne 4 -or $folder.GetTask($inputTask).State -ne 4) { throw 'Installed protection did not remain running.' }
     if ((Get-FileHash -LiteralPath $keyFile).Hash -ne $keyHash) { throw 'Public key changed unexpectedly.' }
     $after = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
     foreach ($field in @('InstallId','Nonce','TargetPulls','UnlockMode','Committed','RecoveryAt','RecoveryRequestedAt','PermanentPass','RecoveryFinished')) {
@@ -216,12 +225,14 @@ try {
     $result.Success = $true; $result.PolicyPreserved = $true
     $result.WaitingForGameInstall = !$gameInstalled
     $result.Backup = $backup
+    $result.ServiceRecovery = $true
 } catch {
     $result.Error = $_.Exception.ToString()
     $result.ErrorLocation = $_.InvocationInfo.PositionMessage
     Write-Error $_ -ErrorAction Continue
     if ($changed) {
         try {
+            if ($serviceChanged -and (Get-WishGuardService $protectionService)) { Stop-WishGuardService $protectionService }
             foreach ($name in @($strongTask,$watchTask,$inputTask)) {
                 try { $folder.GetTask($name).Stop(0); $folder.DeleteTask($name,0) }
                 catch { if (!(Is-MissingTask $_)) { throw } }
@@ -238,6 +249,7 @@ try {
                 $restored = $folder.RegisterTask($name,$oldTasks[$name].Xml,6,$account,$null,$logon,$oldTasks[$name].Sddl)
                 $null = $restored.Run($null)
             }
+            if ($serviceChanged) { Restore-WishGuardService $protectionService $oldService }
             $result.RolledBack = $true
         } catch { $result.RollbackError = $_.Exception.ToString() }
     }

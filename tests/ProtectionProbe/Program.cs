@@ -79,6 +79,11 @@ internal static class Program
             await Command(new("health", true));
             game = Start(fake, "--sentinel"); await Task.Delay(4000); ui.Kill(false);
             Check("forced client termination closes enrolled game", await Until(() => game.HasExited, 3000));
+            var faultRestartTime = Stopwatch.StartNew();
+            game = Start(fake, "--sentinel");
+            Check("fresh enrolled game is closed while protection is still unavailable",
+                await Until(() => game.HasExited, 5000) && faultRestartTime.ElapsedMilliseconds <= 5500 && game.ExitCode != 0);
+            Check("supervisor remains active after rejecting a fresh game", !supervisor.HasExited);
             using (var impostor = new EnforcementClient(profile))
             {
                 bool rejected = false; try { await impostor.Send("health", true); } catch { rejected = true; }
@@ -87,6 +92,8 @@ internal static class Program
             File.Delete(control); File.Delete(control + ".ready");
             ui = Start(exe, "--protection-probe", config, "--control", control);
             Check("protection recovers after client restart", await Until(() => File.Exists(control + ".ready")));
+            game = Start(fake, "--sentinel"); await Task.Delay(4500);
+            Check("fresh enrolled game survives startup grace after trusted health recovers", !game.HasExited);
             var requested = await Command(new("recover-request"));
             Check("recovery requires a full day", requested.Ok && requested.RecoveryAt - requested.RecoveryRequestedAt == 86400);
             Check("early recovery rejected", !(await Command(new("recover-finish"))).Ok);

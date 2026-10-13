@@ -12,68 +12,96 @@ internal static class Program
 {
     static async Task<int> Main(string[] args)
     {
-        if (args.Length != 2 || args[0] is not ("--profile" or "--input-profile")) return 2;
-        string path = Path.GetFullPath(args[1]);
-        var profile = EnforcementPaths.Read(path);
-        if (args[0] == "--input-profile")
-        {
-            if (profile.TestOnly && (profile.GamePaths.Length != 1 || Path.GetFileName(profile.GamePaths[0]) != "WishGuardProbeGame.exe")) return 3;
-            return await InputBroker.Run(path, profile);
-        }
-        if (!profile.TestOnly)
-        {
-            if (!WindowsIdentity.GetCurrent().IsSystem || !string.Equals(path, EnforcementPaths.Profile(profile.OwnerSid), StringComparison.OrdinalIgnoreCase)) return 3;
-            if (profile.GamePaths.Length == 0 || profile.GamePaths.Any(p => Path.GetFileName(p) is not ("YuanShen.exe" or "GenshinImpact.exe"))) return 3;
-        }
-        else if (profile.GamePaths.Length != 1 || Path.GetFileName(profile.GamePaths[0]) != "WishGuardProbeGame.exe") return 3;
-        if (!profile.Policy.Committed || profile.Policy.TargetPulls != 600 || profile.Policy.UnlockMode != "permanent") return 3;
-        using var singleton = new Mutex(true, "Global\\" + profile.PipeName, out bool first);
-        if (!first) return 0;
-        if (profile.Completed) { RemoveTask(profile); return 0; }
-        using var stop = new CancellationTokenSource();
-        var monitor = new Supervisor(path, profile);
-        Task server = monitor.Serve(stop.Token);
-        try { await monitor.Run(stop.Token); }
-        finally { stop.Cancel(); try { await server; } catch (OperationCanceledException) { } }
-        RemoveTask(monitor.Profile);
-        return 0;
-    }
-    static void RemoveTask(EnforcementProfile profile)
-    {
-        if (profile.TestOnly || !profile.Completed || !profile.TaskName.StartsWith("WishGuard-Strong-", StringComparison.Ordinal)) return;
-        dynamic service = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service")!)!;
-        object? folder = null;
         try
         {
-            service.Connect(); folder = service.GetFolder("\\");
-            foreach (var item in new[] { (profile.TaskName, "WishGuard strong protection"), (profile.TaskName + "-Input", "WishGuard input compatibility") })
+            if (args.Length != 2 || args[0] is not ("--profile" or "--input-profile" or "--service-profile")) return 2;
+            string path = Path.GetFullPath(args[1]);
+            var profile = EnforcementPaths.Read(path);
+            if (args[0] == "--input-profile")
             {
-                try
-                {
-                    dynamic task = ((dynamic)folder).GetTask(item.Item1);
-                    if ((string)task.Definition.RegistrationInfo.Source == item.Item2 &&
-                        string.Equals((string)task.Definition.Actions.Item(1).Path, profile.EnforcerExecutable, StringComparison.OrdinalIgnoreCase))
-                        ((dynamic)folder).DeleteTask(item.Item1, 0);
-                }
-                catch (Exception e) when (e.HResult == unchecked((int)0x80070002)) { }
+                if (profile.TestOnly && (profile.GamePaths.Length != 1 || Path.GetFileName(profile.GamePaths[0]) != "WishGuardProbeGame.exe")) return 3;
+                return await InputBroker.Run(path, profile);
             }
+            bool service = args[0] == "--service-profile";
+            if (!profile.TestOnly)
+            {
+                if (!WindowsIdentity.GetCurrent().IsSystem || !string.Equals(path, EnforcementPaths.Profile(profile.OwnerSid), StringComparison.OrdinalIgnoreCase)) return 3;
+                if (profile.GamePaths.Length == 0 || profile.GamePaths.Any(p => Path.GetFileName(p) is not ("YuanShen.exe" or "GenshinImpact.exe"))) return 3;
+                if (service && (profile.ServiceName != "WishGuard-Protection-" + EnforcementPaths.Key(profile.OwnerSid) ||
+                    profile.TaskName != "WishGuard-Strong-" + EnforcementPaths.Key(profile.OwnerSid))) return 3;
+            }
+            else
+            {
+                if (profile.GamePaths.Length != 1 || Path.GetFileName(profile.GamePaths[0]) != "WishGuardProbeGame.exe") return 3;
+                if (service && (!WindowsIdentity.GetCurrent().IsSystem || !profile.ServiceName.StartsWith("WishGuard-Test-", StringComparison.Ordinal) ||
+                    !profile.TaskName.StartsWith("WishGuard-Test-", StringComparison.Ordinal))) return 3;
+            }
+            if (service && !string.Equals(Path.GetFullPath(profile.EnforcerExecutable), Environment.ProcessPath, StringComparison.OrdinalIgnoreCase)) return 3;
+            if (!profile.Policy.Committed || profile.Policy.TargetPulls != 600 || profile.Policy.UnlockMode != "permanent") return 3;
+            if (service) return ServiceHost.Run(profile.ServiceName, cancel => RunSupervisor(path, profile, true, cancel));
+            return await RunSupervisor(path, profile, false, CancellationToken.None);
         }
-        catch (Exception e) when (e.HResult == unchecked((int)0x80070002)) { }
-        finally { if (folder != null) Marshal.FinalReleaseComObject(folder); Marshal.FinalReleaseComObject(service); }
+        catch (Exception) { return 1; }
+    }
+
+    static async Task<int> RunSupervisor(string path, EnforcementProfile profile, bool service, CancellationToken cancel)
+    {
+        using var singleton = new Mutex(true, "Global\\" + profile.PipeName, out bool first);
+        if (!first) return service ? 1 : 0;
+        void Complete(EnforcementProfile finished)
+        {
+            if (!finished.Completed) return;
+            RegisteredTaskRecovery.RemoveCompleted(path, finished);
+            // Keep SCM recovery available until task cleanup succeeds. A
+            // transient scheduler error then retries completion, without ever
+            // restarting protection for the durably completed plan.
+            if (service) ServiceHost.DisableAndDelete(path, finished);
+        }
+        if (profile.Completed) { Complete(profile); return 0; }
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+        RegisteredTaskRecovery? recovery = null;
+        var monitor = new Supervisor(path, profile, service ? () => recovery?.Ready == true : null);
+        if (service) recovery = new RegisteredTaskRecovery(path, profile, () => !monitor.Profile.Completed, monitor.Log);
+        Task server = monitor.Serve(stop.Token);
+        Task repair = recovery == null ? Task.Delay(Timeout.Infinite, stop.Token) : Task.Run(() => recovery.Run(stop.Token));
+        Task supervision = monitor.Run(stop.Token);
+        try
+        {
+            Task finished = await Task.WhenAny(supervision, server, repair);
+            if (finished != supervision)
+            {
+                await finished;
+                cancel.ThrowIfCancellationRequested();
+                // Repair normally ends as soon as completion is committed; the
+                // supervisor still waits for its completed reply to be published.
+                if (finished != repair || !monitor.Profile.Completed) throw new IOException("A protection monitor stopped unexpectedly.");
+            }
+            await supervision;
+            if (!monitor.Profile.Completed && !cancel.IsCancellationRequested) throw new IOException("Protection stopped before the plan completed.");
+        }
+        finally
+        {
+            stop.Cancel();
+            try { await server; } catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+            try { await repair; } catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+            try { await supervision; } catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+        }
+        Complete(monitor.Profile);
+        return 0;
     }
 }
 
-public sealed class Supervisor(string file, EnforcementProfile profile)
+public sealed class Supervisor(string file, EnforcementProfile profile, Func<bool>? componentsReady = null)
 {
-    public EnforcementProfile Profile => profile;
     readonly object sync = new();
+    public EnforcementProfile Profile { get { lock (sync) return profile; } }
     readonly Stopwatch uptime = Stopwatch.StartNew();
     readonly long startWall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     readonly Dictionary<(int Pid, long Start), long> games = new();
     int clientId; long lastHealth = -10000; bool healthy;
     volatile bool completionPublished;
     long Now => Math.Max(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), startWall + uptime.ElapsedMilliseconds / 1000);
-    void Log(string name)
+    internal void Log(string name)
     {
         try
         {
@@ -150,7 +178,7 @@ public sealed class Supervisor(string file, EnforcementProfile profile)
             lock (sync)
             {
                 if (profile.Completed && completionPublished) break;
-                allowed = profile.Completed || healthy && uptime.ElapsedMilliseconds - lastHealth < 1500 && Alive(clientId);
+                allowed = profile.Completed || healthy && uptime.ElapsedMilliseconds - lastHealth < 1500 && Alive(clientId) && (componentsReady?.Invoke() ?? true);
                 if (!profile.Completed && uptime.ElapsedMilliseconds - lastSave > 20000)
                 {
                     try { Save(); lastSave = uptime.ElapsedMilliseconds; }

@@ -13,6 +13,7 @@
 
 GitHub Actions 在 Windows 上构建 .NET 客户端，并运行 `--self-test --skip-ocr`。
 0.3.0 还构建保护组件，并使用独立临时计划与模拟进程检查失效处理、无关进程隔离、冷静期、保存失败回滚及永久解除。测试构建入口不会进入正式客户端。
+0.3.1 额外构建服务恢复检查程序，但 CI 不执行这项管理员测试，也不注册 Windows 服务。普通保护集成检查增加故障后再次启动模拟游戏的场景。
 窗口兼容组件的隔离检查覆盖双方身份验证、拒绝未授权客户端、拒绝无效窗口，以及完成计划后退出。此项不替代高权限真实游戏的焦点与快捷键测试。
 另用临时生成的密钥运行 Python 核验工具检查，验证签名、阈值、不匹配请求和证据时效。
 报告明确标记 OCR 被跳过；CI 不安装语言组件、不启动真实游戏、不更改登录启动项。
@@ -40,6 +41,24 @@ dotnet run --project tests/LifecycleProbe -c Release -- artifacts/app artifacts/
 ```
 
 第二个路径必须是本轮 `--self-test --data` 使用的目录，第三个路径必须尚不存在。测试不使用实际游戏，也不替用户重启或注销 Windows；登录触发仍需在下一次自然登录时确认。
+
+## 0.3.1 服务恢复检查
+
+`tests/ServiceRecoveryProbe` 必须在可交互桌面中由本机管理员明确运行。它复制测试构建至新目录，使用临时密钥、模拟游戏、无触发器的临时组件任务和一次初始服务启动；测试结束仅清理本轮核对过身份的服务、任务和进程。不得使用真实计划、私钥或正式安装任务代替这些临时材料。
+
+```powershell
+dotnet build src/WishGuard.csproj -c Release -p:WishGuardTestHooks=true -t:Rebuild -o artifacts/test-client
+dotnet build enforcer/WishGuard.Enforcer.csproj -c Release -p:WishGuardTestHooks=false -t:Rebuild -o artifacts/enforcer
+dotnet build tests/ServiceRecoveryProbe/ServiceRecoveryProbe.csproj -c Release -o artifacts/service-recovery-probe
+# 在管理员终端中运行；第三个目录必须尚不存在。
+./artifacts/service-recovery-probe/ServiceRecoveryProbe.exe artifacts/test-client artifacts/enforcer artifacts/fresh-service-recovery
+```
+
+检查覆盖四次服务异常退出、等待组件单独异常、输入组件单独异常、全部组件同时异常、拒绝不匹配的任务定义，以及恢复后重新启动模拟游戏。永久凭证使用本轮临时密钥签发，检查保存完成状态、主动移除服务与任务，及超过恢复延迟后仍不重新启动。检查通过实际进程身份、进程代次、管道身份、任务定义和模拟游戏存活判断结果。
+
+这里的等待组件使用可信心跳探针，输入连接按正式客户端的重连方式重试；它不运行 OCR，不发送实际键鼠输入，也不证明真实游戏的完整会话兼容性。正式安装的游戏画面与操作仍需单独实测。报告与临时密钥均不提交仓库。
+
+本机 0.3.1 普通保护集成检查 24 项、管理员服务恢复检查 65 项全部通过；临时服务和任务清理无错误。此前 26 项窗口检查与 43 项跨进程后台检查是上一轮结果，本轮没有修改遮挡逻辑，也没有重新执行这两组测试。正式更新后，使用者另行确认真实原神正常运行、F3 进入时遮挡及 Esc 返回正常；该实测没有抽卡。
 
 ## 不能据此保证的情况
 

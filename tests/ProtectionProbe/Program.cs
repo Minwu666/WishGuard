@@ -48,6 +48,23 @@ internal static class Program
             if (!await Until(() => File.Exists(control + ".reply"))) throw new IOException("Missing reply");
             return JsonSerializer.Deserialize<ProtectionReply>(File.ReadAllText(control + ".reply"))!;
         }
+        string Sign(Grant grant)
+        {
+            byte[] payload = JsonSerializer.SerializeToUtf8Bytes(grant);
+            return JsonSerializer.Serialize(new Envelope(Rules.Encode(payload), Rules.Encode(key.SignData(payload,
+                HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence))));
+        }
+        EnforcementProfile Saved() => EnforcementPaths.Read(config);
+        static void Stop(Process process)
+        {
+            if (!process.HasExited) process.Kill(false);
+            if (!process.WaitForExit(3000)) throw new IOException("Test child did not stop.");
+        }
+        void ClearControl()
+        {
+            foreach (string suffix in new[] { "", ".ready", ".reply", ".error" })
+                if (File.Exists(control + suffix)) File.Delete(control + suffix);
+        }
         int exit = 1;
         try
         {
@@ -106,9 +123,101 @@ internal static class Program
             Directory.Delete(config + ".tmp");
             Check("rollback preserves prior recovery state", (await Command(new("status"))).RecoveryAt == null);
             long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            const string temporaryId = "probe-temporary";
+            string temporaryToken = Sign(new Grant("wishguard-v2", profile.Policy.InstallId, profile.Policy.PolicyId,
+                profile.Policy.Nonce, temporaryId, now, now + 86400, 0, "temporary", DurationSeconds: 1800,
+                ApprovalReason: "Isolated integration approval for a new character."));
+            Check("temporary pass cannot use permanent completion endpoint", !(await Command(new("unlock", Token: temporaryToken))).Ok);
+            Check("wrong completion endpoint preserves locked 600-pull plan", !Saved().Completed && Saved().Policy.PermanentPass == null &&
+                Saved().Policy.TargetPulls == 600 && Saved().Policy.UnlockMode == "permanent");
+
+            // A failed durable save must not consume the signed token or permit a game.
+            Directory.CreateDirectory(config + ".tmp");
+            Check("failed save rejects temporary activation", !(await Command(new("temporary-unlock", Token: temporaryToken))).Ok);
+            Directory.Delete(config + ".tmp");
+            var afterFailedTemporary = await Command(new("status"));
+            Check("failed temporary save rolls back receipt and used id", afterFailedTemporary.TemporaryPass == null &&
+                afterFailedTemporary.TemporaryActivatedAt == null && afterFailedTemporary.TemporaryUntil == null &&
+                afterFailedTemporary.UsedPasses?.Contains(temporaryId) != true && !afterFailedTemporary.Completed);
+            Check("failed temporary save leaves persisted plan locked", Saved().Policy.TemporaryPass == null &&
+                !Saved().Policy.UsedPasses.Contains(temporaryId) && !Saved().Completed);
+            await Command(new("health", false));
+            Check("failed temporary save does not grant unavailable protection", await Until(() => game.HasExited, 3000));
+            game = Start(fake, "--sentinel");
+            Check("failed temporary save cannot permit a fresh game", await Until(() => game.HasExited, 5000));
+
+            long beforeActivation = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var temporary = await Command(new("temporary-unlock", Token: temporaryToken));
+            Check("same unconsumed temporary pass activates after storage recovers", temporary.Ok && temporary.TemporaryPass == temporaryToken &&
+                temporary.TemporaryActivatedAt is { } activated && activated >= beforeActivation &&
+                temporary.TemporaryUntil == activated + 1800 && temporary.LastSeen >= activated &&
+                temporary.UsedPasses?.Contains(temporaryId) == true);
+            Check("temporary activation preserves permanent plan and supervisor", !temporary.Completed && !supervisor.HasExited && !input.HasExited &&
+                Saved().Policy.Committed && Saved().Policy.TargetPulls == 600 && Saved().Policy.UnlockMode == "permanent" &&
+                Saved().Policy.PermanentPass == null && !Saved().Completed);
+            Check("temporary receipt and consumption are saved durably", Saved().Policy.TemporaryPass == temporaryToken &&
+                Saved().Policy.TemporaryActivatedAt == temporary.TemporaryActivatedAt &&
+                Saved().Policy.TemporaryUntil == temporary.TemporaryUntil && Saved().Policy.UsedPasses.Contains(temporaryId));
+            game = Start(fake, "--sentinel"); await Task.Delay(4500);
+            Check("active temporary receipt permits game without healthy client", !game.HasExited);
+
+            // Switch commands so the trusted probe processes a duplicate activation.
+            await Command(new("status"));
+            Check("temporary pass is rejected on second activation", !(await Command(new("temporary-unlock", Token: temporaryToken))).Ok);
+            var afterDuplicate = await Command(new("status"));
+            Check("duplicate temporary activation neither extends time nor consumes again",
+                afterDuplicate.TemporaryActivatedAt == temporary.TemporaryActivatedAt && afterDuplicate.TemporaryUntil == temporary.TemporaryUntil &&
+                afterDuplicate.UsedPasses?.Count(id => id == temporaryId) == 1 && !afterDuplicate.Completed);
+
+            // Restart only the isolated processes and reload the persisted receipt.
+            Stop(ui); Stop(input); Stop(supervisor); ClearControl();
+            supervisor = Start(profile.EnforcerExecutable, "--profile", config);
+            input = Start(profile.EnforcerExecutable, "--input-profile", config);
+            ui = Start(exe, "--protection-probe", config, "--control", control);
+            Check("temporary plan reconnects after supervisor and client restart", await Until(() => File.Exists(control + ".ready")));
+            var restartedTemporary = await Command(new("health", false));
+            Check("restart reloads original receipt without restarting thirty minutes", restartedTemporary.TemporaryPass == temporaryToken &&
+                restartedTemporary.TemporaryActivatedAt == temporary.TemporaryActivatedAt && restartedTemporary.TemporaryUntil == temporary.TemporaryUntil &&
+                restartedTemporary.UsedPasses?.Contains(temporaryId) == true && !restartedTemporary.Completed);
+            Check("used temporary id remains rejected after restart", !(await Command(new("temporary-unlock", Token: temporaryToken))).Ok);
+            var afterRestartDuplicate = await Command(new("status"));
+            Check("restart replay preserves original deadline", afterRestartDuplicate.TemporaryUntil == temporary.TemporaryUntil &&
+                afterRestartDuplicate.TemporaryActivatedAt == temporary.TemporaryActivatedAt &&
+                afterRestartDuplicate.UsedPasses?.Count(id => id == temporaryId) == 1);
+            Stop(game); game = Start(fake, "--sentinel");
+            await Task.Delay(4500);
+            Check("restarted supervisor honors remaining temporary time for a fresh game", !game.HasExited && !supervisor.HasExited && !input.HasExited);
+
+            // Simulate an expired, previously activated receipt in a separate profile.
+            // Never change the machine clock or wait thirty minutes in this probe.
+            Stop(game);
+            var expiredProfile = JsonSerializer.Deserialize<EnforcementProfile>(JsonSerializer.Serialize(Saved()))!;
+            expiredProfile.PipeName = "WishGuard-test-expired-" + Guid.NewGuid().ToString("N");
+            expiredProfile.DataDirectory = Path.Combine(root, "expired-data");
+            long expiredNow = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            const string expiredId = "probe-expired-temporary";
+            string expiredToken = Sign(new Grant("wishguard-v2", expiredProfile.Policy.InstallId, expiredProfile.Policy.PolicyId,
+                expiredProfile.Policy.Nonce, expiredId, expiredNow - 1900, expiredNow + 84500, 0, "temporary", DurationSeconds: 1800,
+                ApprovalReason: "Isolated expired receipt fixture."));
+            expiredProfile.Policy.TemporaryPass = expiredToken;
+            expiredProfile.Policy.TemporaryActivatedAt = expiredNow - 1900;
+            expiredProfile.Policy.TemporaryUntil = expiredNow - 100;
+            expiredProfile.Policy.LastSeen = expiredNow - 1;
+            expiredProfile.Policy.UsedPasses.Add(expiredId);
+            string expiredConfig = Path.Combine(root, "expired-profile.json");
+            EnforcementPaths.Save(expiredConfig, expiredProfile);
+            var expiredSupervisor = Start(expiredProfile.EnforcerExecutable, "--profile", expiredConfig);
+            await Task.Delay(1000); Stop(expiredSupervisor);
+            expiredSupervisor = Start(expiredProfile.EnforcerExecutable, "--profile", expiredConfig);
+            game = Start(fake, "--sentinel");
+            Check("expired persisted temporary receipt cannot permit game after restart", await Until(() => game.HasExited, 5000));
+            Check("temporary expiration keeps supervisor and 600-pull plan enrolled", !expiredSupervisor.HasExited &&
+                !EnforcementPaths.Read(expiredConfig).Completed && EnforcementPaths.Read(expiredConfig).Policy.TargetPulls == 600 &&
+                EnforcementPaths.Read(expiredConfig).Policy.TemporaryUntil == expiredNow - 100);
+            Stop(expiredSupervisor);
+
             var grant = new Grant("wishguard-v2", profile.Policy.InstallId, profile.Policy.PolicyId, profile.Policy.Nonce, "probe", now, now + 3600, 600, "permanent");
-            byte[] payload = JsonSerializer.SerializeToUtf8Bytes(grant);
-            string token = JsonSerializer.Serialize(new Envelope(Rules.Encode(payload), Rules.Encode(key.SignData(payload, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence))));
+            string token = Sign(grant);
             var unlocked = await Command(new("unlock", Token: token));
             Check("valid 600-pull pass acknowledged before shutdown", unlocked.Ok && unlocked.Completed && unlocked.PermanentPass == token);
             Check("permanent completion stops protection", await Until(() => supervisor.HasExited));

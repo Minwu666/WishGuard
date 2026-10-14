@@ -44,6 +44,11 @@ public sealed class EnforcementClient : IDisposable
             var reply = JsonSerializer.Deserialize<ProtectionReply>(line) ?? throw new IOException("保护状态无法确认。");
             if (!reply.Ok) throw new IOException(reply.Message);
             profile.Completed = reply.Completed;
+            profile.Policy.TemporaryPass = reply.TemporaryPass;
+            profile.Policy.TemporaryActivatedAt = reply.TemporaryActivatedAt;
+            profile.Policy.TemporaryUntil = reply.TemporaryUntil;
+            profile.Policy.LastSeen = Math.Max(profile.Policy.LastSeen, reply.LastSeen);
+            if (reply.UsedPasses != null) profile.Policy.UsedPasses = new(reply.UsedPasses);
             return reply;
         }
         finally { mutex.Release(); }

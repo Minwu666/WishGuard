@@ -97,10 +97,23 @@ public sealed class Supervisor(string file, EnforcementProfile profile, Func<boo
     public EnforcementProfile Profile { get { lock (sync) return profile; } }
     readonly Stopwatch uptime = Stopwatch.StartNew();
     readonly long startWall = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    long highWaterNow;
     readonly Dictionary<(int Pid, long Start), long> games = new();
     int clientId; long lastHealth = -10000; bool healthy;
     volatile bool completionPublished;
-    long Now => Math.Max(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), startWall + uptime.ElapsedMilliseconds / 1000);
+    long Now
+    {
+        get
+        {
+            long candidate = Math.Max(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), startWall + uptime.ElapsedMilliseconds / 1000);
+            while (true)
+            {
+                long previous = Interlocked.Read(ref highWaterNow);
+                long current = Math.Max(previous, candidate);
+                if (Interlocked.CompareExchange(ref highWaterNow, current, previous) == previous) return current;
+            }
+        }
+    }
     internal void Log(string name)
     {
         try
@@ -150,6 +163,10 @@ public sealed class Supervisor(string file, EnforcementProfile profile, Func<boo
                                 if (Rules.ClockRolledBack(profile.Policy, Now)) throw new IOException();
                                 var grant = Rules.Validate(request.Token ?? "", profile.PublicKey, profile.Policy, Now, true);
                                 profile.Policy.PermanentPass = request.Token; profile.Policy.UsedPasses.Add(grant.Id); profile.Completed = true; Save(); break;
+                            case "temporary-unlock":
+                                if (profile.Completed) throw new IOException("计划已经结束。");
+                                Rules.ActivateTemporary(profile.Policy, request.Token ?? "", profile.PublicKey, Now);
+                                Save(); break;
                             default: throw new IOException("请求无效。");
                         }
                         reply = Reply(true, "");
@@ -167,7 +184,9 @@ public sealed class Supervisor(string file, EnforcementProfile profile, Func<boo
             catch (Exception) { Log("connection-error"); await Task.Delay(100, cancel); }
         }
     }
-    ProtectionReply Reply(bool ok, string message) => new(ok, profile.Completed, profile.Policy.RecoveryAt, profile.Policy.RecoveryRequestedAt, profile.Policy.RecoveryFinished, message, profile.Policy.PermanentPass);
+    ProtectionReply Reply(bool ok, string message) => new(ok, profile.Completed, profile.Policy.RecoveryAt, profile.Policy.RecoveryRequestedAt,
+        profile.Policy.RecoveryFinished, message, profile.Policy.PermanentPass, profile.Policy.TemporaryPass,
+        profile.Policy.TemporaryActivatedAt, profile.Policy.TemporaryUntil, profile.Policy.UsedPasses.ToArray(), profile.Policy.LastSeen);
     void Save() { profile.Policy.LastSeen = Math.Max(profile.Policy.LastSeen, Now); EnforcementPaths.Save(file, profile); }
     public async Task Run(CancellationToken cancel)
     {
@@ -178,7 +197,8 @@ public sealed class Supervisor(string file, EnforcementProfile profile, Func<boo
             lock (sync)
             {
                 if (profile.Completed && completionPublished) break;
-                allowed = profile.Completed || healthy && uptime.ElapsedMilliseconds - lastHealth < 1500 && Alive(clientId) && (componentsReady?.Invoke() ?? true);
+                allowed = profile.Completed || Rules.TemporaryActive(profile.Policy, profile.PublicKey, Now) ||
+                    healthy && uptime.ElapsedMilliseconds - lastHealth < 1500 && Alive(clientId) && (componentsReady?.Invoke() ?? true);
                 if (!profile.Completed && uptime.ElapsedMilliseconds - lastSave > 20000)
                 {
                     try { Save(); lastSave = uptime.ElapsedMilliseconds; }

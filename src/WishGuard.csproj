@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>WishGuard</AssemblyName>
-    <Version>0.3.2</Version>
+    <Version>0.4.0</Version>
   </PropertyGroup>
   <PropertyGroup Condition="'$(WishGuardTestHooks)' == 'true'">
     <DefineConstants>$(DefineConstants);WISHGUARD_TESTS</DefineConstants>

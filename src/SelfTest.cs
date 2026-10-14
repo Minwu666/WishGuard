@@ -20,6 +20,9 @@ public static class SelfTest
         void Reject(Action action) { bool rejected=false; try { action(); } catch { rejected=true; } Expect(rejected); }
         string data = Program.GetArg(args,"--data") ?? Path.Combine(Path.GetTempPath(),"WishGuardTest-"+Guid.NewGuid().ToString("N")); Directory.CreateDirectory(data);
         Check("600 pull boundary",()=>Expect(Rules.Pulls(95999,0)==599 && Rules.Pulls(96000,0)==600 && Rules.Pulls(80000,100)==600));
+        TemporaryPolicyTests.Run(Check, data);
+        if (Program.GetArg(args, "--temporary-fixture") is { } temporaryFixture)
+            Check("Python temporary signature and activation interoperate", () => TemporaryPolicyTests.VerifyInterop(temporaryFixture));
         Check("new screen stays covered until repeated clear frames",()=> { var gate=new ScreenGate();Expect(gate.Blocked);gate.Observe(gate.Version,true,false);Expect(gate.Blocked);gate.Observe(gate.Version,true,false);Expect(!gate.Blocked); });
         Check("wish detection covers immediately",()=> { var gate=new ScreenGate();gate.Observe(gate.Version,true,true);Expect(gate.Blocked&&gate.WishSeen); });
         Check("switching away and returning preserves wish history",()=> { var gate=new ScreenGate();gate.Observe(gate.Version,true,true);gate.Recheck();Expect(gate.Blocked&&gate.WishSeen);gate.Observe(gate.Version,true,false);gate.Observe(gate.Version,true,false);Expect(gate.Blocked);gate.Observe(gate.Version,true,false);Expect(!gate.Blocked); });

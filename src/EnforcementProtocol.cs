@@ -24,7 +24,9 @@ public sealed class EnforcementProfile
     public bool TestOnly { get; set; }
 }
 public sealed record ProtectionRequest(string Command, bool Healthy = false, string? Token = null);
-public sealed record ProtectionReply(bool Ok, bool Completed, long? RecoveryAt, long? RecoveryRequestedAt, bool RecoveryFinished, string Message, string? PermanentPass = null);
+public sealed record ProtectionReply(bool Ok, bool Completed, long? RecoveryAt, long? RecoveryRequestedAt, bool RecoveryFinished, string Message,
+    string? PermanentPass = null, string? TemporaryPass = null, long? TemporaryActivatedAt = null, long? TemporaryUntil = null,
+    string[]? UsedPasses = null, long LastSeen = 0);
 public static class EnforcementPaths
 {
     public static string Owner => WindowsIdentity.GetCurrent().User!.Value;
@@ -62,10 +64,14 @@ public static class EnforcementPaths
         var s = store.State; var p = profile.Policy;
         bool changed = s.InstallId != p.InstallId || s.Nonce != p.Nonce || s.Committed != p.Committed ||
             !s.StartWithWindows || s.RecoveryAt != p.RecoveryAt || s.RecoveryRequestedAt != p.RecoveryRequestedAt ||
-            s.RecoveryFinished != p.RecoveryFinished || s.PermanentPass != p.PermanentPass;
+            s.RecoveryFinished != p.RecoveryFinished || s.PermanentPass != p.PermanentPass ||
+            s.TemporaryPass != p.TemporaryPass || s.TemporaryActivatedAt != p.TemporaryActivatedAt || s.TemporaryUntil != p.TemporaryUntil ||
+            s.LastSeen < p.LastSeen || !s.UsedPasses.SequenceEqual(p.UsedPasses);
         s.InstallId = p.InstallId; s.Nonce = p.Nonce; s.Committed = p.Committed; s.StartWithWindows = true;
         s.RecoveryAt = p.RecoveryAt; s.RecoveryRequestedAt = p.RecoveryRequestedAt;
         s.RecoveryFinished = p.RecoveryFinished; s.PermanentPass = p.PermanentPass;
+        s.TemporaryPass = p.TemporaryPass; s.TemporaryActivatedAt = p.TemporaryActivatedAt; s.TemporaryUntil = p.TemporaryUntil;
+        s.LastSeen = Math.Max(s.LastSeen, p.LastSeen);
         s.UsedPasses = new(p.UsedPasses);
         if (changed) store.Save();
     }

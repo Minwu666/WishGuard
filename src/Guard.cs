@@ -90,6 +90,8 @@ public sealed class GuardController : IDisposable
     InputBrokerClient? inputBroker;
     bool inputBusy;
     bool fastBusy, resourceBusy, fastReady, resourceReady;
+    bool temporaryWasActive;
+    long highWaterNow;
     int fastAttempts, resourceAttempts;
     long fastRetryAt, resourceRetryAt;
     long entrySerial, returnSerial;
@@ -98,7 +100,7 @@ public sealed class GuardController : IDisposable
     long entryBlockedUntil;
     long lastMinimize = -1000;
     long startedAt;
-    bool CoverRequired => gate.Blocked && (gameplaySeen || gate.WishSeen || uptime.ElapsedMilliseconds < entryBlockedUntil);
+    bool CoverRequired => !TemporaryActive && gate.Blocked && (gameplaySeen || gate.WishSeen || uptime.ElapsedMilliseconds < entryBlockedUntil);
     public bool Strong { get; set; }
     public void UseInputBroker(EnforcementProfile profile) { shield.Passive = true; inputBroker = new(profile); }
 #if WISHGUARD_TESTS
@@ -120,6 +122,7 @@ public sealed class GuardController : IDisposable
     internal bool SceneDelayBusyForTest, DelayedSceneWasWishForTest;
     internal string? SceneTextOverrideForTest;
     internal long SceneReadCountForTest;
+    internal Func<long>? ClockForTest;
 #endif
     bool protectionAvailable = true;
     public void ProtectionAvailable(bool available)
@@ -169,7 +172,39 @@ public sealed class GuardController : IDisposable
             return (Running && (!gameplaySeen || uptime.ElapsedMilliseconds - lastRecognition < 2500) || !gameplaySeen && uptime.ElapsedMilliseconds - startedAt < 2500) ? "ready" : "recognition-stale";
         }
     }
-    public long Now => Math.Max(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), startWall + (long)uptime.Elapsed.TotalSeconds);
+    public long Now
+    {
+        get
+        {
+#if WISHGUARD_TESTS
+            if (ClockForTest != null) return ClockForTest();
+#endif
+            highWaterNow = Math.Max(highWaterNow, Math.Max(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), startWall + (long)uptime.Elapsed.TotalSeconds));
+            return highWaterNow;
+        }
+    }
+    public bool TemporaryActive => !store.Fault && Rules.TemporaryActive(store.State, publicKey, Now);
+    public long TemporaryRemaining => TemporaryActive ? Math.Max(0, store.State.TemporaryUntil!.Value - Now) : 0;
+    public void RefreshTemporary()
+    {
+        if (disposed) return;
+        bool active = TemporaryActive;
+        if (active == temporaryWasActive) return;
+        temporaryWasActive = active; gate.Reset(); latched = 0; misses = 0; entryBlockedUntil = 0;
+        shortcutWasDown = false; consensus.Reset(); nextResourceRead = 0;
+        if (active)
+        {
+            entryShortcut.Enable(false);
+            if (shield.Visible) RestoreGame(Native.GetGame(DemoHandle)?.Handle ?? 0);
+            Phase = "临时放行"; Status = "临时凭证已生效，到期自动恢复 600 抽守护。";
+        }
+        else
+        {
+            Phase = "守护中"; Status = "临时放行已结束，继续原来的 600 抽计划。";
+            store.Log("temporary_expired", "临时放行已结束");
+        }
+        Changed?.Invoke();
+    }
     public GuardController(StateStore store, string publicKey)
     {
         this.store = store; this.publicKey = publicKey; timer.Tick += async (_, _) => await Tick();
@@ -202,9 +237,11 @@ public sealed class GuardController : IDisposable
     void UpdateFocus()
     {
         if (disposed || returningToGame) return;
+        RefreshTemporary();
         nint fg = Native.GetForegroundWindow();
         // A zero foreground HWND is a handoff, not an application switch.
         if (fg == 0) return;
+        if (TemporaryActive) { entryShortcut.Enable(false); shield.Conceal(); lastForeground = fg; return; }
         if (Strong && armed)
         {
             bool target = DemoHandle != 0 ? fg == DemoHandle : !IgnoreRealGame && Native.ProcessName(fg) is "YuanShen" or "GenshinImpact";
@@ -258,7 +295,7 @@ public sealed class GuardController : IDisposable
     }
     void OnWishEntry()
     {
-        if (disposed || !Strong || !armed || !Running) return;
+        if (disposed || !Strong || !armed || !Running || TemporaryActive) return;
         nint fg = Native.GetForegroundWindow();
         bool game = DemoHandle != 0 ? fg == DemoHandle : !IgnoreRealGame && Native.ProcessName(fg) is "YuanShen" or "GenshinImpact";
         if (!game || Native.BoundsOf(fg) == null) return;
@@ -315,6 +352,12 @@ public sealed class GuardController : IDisposable
         Stop("600 抽目标已核验，守护已永久解除。"); Phase = "已永久解除";
         store.Log("permanent_unlock", "600 抽永久凭证已接受"); Changed?.Invoke();
     }
+    public void ImportTemporary(string token)
+    {
+        store.Commit(state => Rules.ActivateTemporary(state, token, publicKey, Now));
+        store.Log("temporary_unlocked", "一次性 30 分钟临时凭证已接受");
+        RefreshTemporary(); UpdateFocus(); Changed?.Invoke();
+    }
     async Task PrepareAuxiliaryWorker(OcrWorker worker, int generation, bool quick)
     {
         if (quick) { fastOcr?.Dispose(); fastOcr = worker; }
@@ -345,7 +388,7 @@ public sealed class GuardController : IDisposable
     }
     async Task FastTick()
     {
-        if (disposed || !Running || !armed || !fastReady || fastBusy || fastOcr == null) return;
+        if (disposed || !Running || !armed || !fastReady || fastBusy || fastOcr == null || TemporaryActive) return;
         nint foreground = Native.GetForegroundWindow();
         nint cover = shield.IsHandleCreated ? shield.Handle : 0;
         nint game = cover != 0 && foreground == cover ? latched : foreground;
@@ -358,7 +401,7 @@ public sealed class GuardController : IDisposable
             using var area = FastWishVision.Capture(bounds);
             using var prepared = FastWishVision.Prepare(area);
             string text = await worker.Read(prepared);
-            if (disposed || !Running || generation != epoch || version != gate.Version) return;
+            if (disposed || !Running || generation != epoch || version != gate.Version || TemporaryActive) return;
             nint current = Native.GetForegroundWindow();
             if ((current != game && current != shield.Handle) || Native.BoundsOf(game) != bounds) return;
 #if WISHGUARD_TESTS
@@ -404,7 +447,7 @@ public sealed class GuardController : IDisposable
             var result = await ResourceReader.Read(frame, worker);
             nint foreground = Native.GetForegroundWindow();
             if (disposed || generation != epoch || !Running || latched != game.Handle ||
-                Strong && (version != gate.Version || !gate.WishSeen) || Native.BoundsOf(game.Handle) != game.Bounds ||
+                Strong && (version != gate.Version || !gate.WishSeen && !TemporaryActive) || Native.BoundsOf(game.Handle) != game.Bounds ||
                 (foreground != game.Handle && foreground != shield.Handle)) return;
             ResourceStatus = result.Status;
             var snapshot = consensus.Observe(result, observedAt);
@@ -436,8 +479,15 @@ public sealed class GuardController : IDisposable
         }
         finally { frame.Dispose(); resourceBusy = false; }
     }
+    void QueueResources(Bitmap frame, GameWindow game, int generation, int version, long observedAt)
+    {
+        if (!resourceReady || resourceBusy || uptime.ElapsedMilliseconds < nextResourceRead) return;
+        nextResourceRead = uptime.ElapsedMilliseconds + 1600;
+        _ = ReadResources((Bitmap)frame.Clone(), game, generation, version, observedAt);
+    }
     async Task Tick()
     {
+        RefreshTemporary();
         RetryAuxiliaryWorkers();
         if (busy || disposed || !Running || ocr == null) return;
         busy = true; int generation = epoch; var worker = ocr;
@@ -451,7 +501,7 @@ public sealed class GuardController : IDisposable
             if (fg != game.Handle && fg != shield.Handle) { LeaveGame(game); Phase = "守护待命"; Status = "已切换到其他应用，暂不截图。"; return; }
             if (latched != 0 && latched != game.Handle) { latched = 0; misses = 0; consensus.Reset(); }
             if (Strong) UpdateFocus();
-            if (latched == game.Handle || Strong && CoverRequired) shield.Place(game.Bounds, game.Handle);
+            if (!TemporaryActive && (latched == game.Handle || Strong && CoverRequired)) shield.Place(game.Bounds, game.Handle);
             int viewVersion = gate.Version;
             var watch = Stopwatch.StartNew(); long observedAt = Now;
             using var frame = Native.CaptureFrame(game.Bounds);
@@ -483,6 +533,7 @@ public sealed class GuardController : IDisposable
             }
 #endif
             if (disposed || generation != epoch) return;
+            RefreshTemporary();
             LastMilliseconds = watch.Elapsed.TotalMilliseconds;
             if (viewVersion != gate.Version) return;
             lastRecognition = uptime.ElapsedMilliseconds;
@@ -494,6 +545,13 @@ public sealed class GuardController : IDisposable
 #endif
             if (Strong && !gameplaySeen && (wish || SceneText.HasGameHud(text)))
             { gameplaySeen = true; store.Log("gameplay_ready", "已进入游戏画面"); }
+            if (TemporaryActive)
+            {
+                latched = wish ? game.Handle : 0; misses = 0; shield.Conceal(); Phase = "临时放行";
+                Status = "临时凭证已生效，到期自动恢复 600 抽守护。";
+                if (wish) QueueResources(frame, game, generation, viewVersion, observedAt);
+                Changed?.Invoke(); return;
+            }
             if (Strong) gate.Observe(viewVersion, protectionAvailable && !string.IsNullOrWhiteSpace(text), wish, uptime.ElapsedMilliseconds);
             if (wish)
             {
@@ -503,11 +561,7 @@ public sealed class GuardController : IDisposable
                     "遮挡未取得焦点，键盘可能仍传入游戏；请点击遮挡。" : "使用右上角游戏原有的 × 返回，正常游玩会自动恢复。";
                 Changed?.Invoke();
                 // Resource OCR has its own worker and never holds scene recognition.
-                if (resourceReady && !resourceBusy && uptime.ElapsedMilliseconds >= nextResourceRead)
-                {
-                    nextResourceRead = uptime.ElapsedMilliseconds + 1600;
-                    _ = ReadResources((Bitmap)frame.Clone(), game, generation, viewVersion, observedAt);
-                }
+                QueueResources(frame, game, generation, viewVersion, observedAt);
             }
             else if (Strong)
             {

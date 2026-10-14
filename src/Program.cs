@@ -11,6 +11,7 @@ static class Program
         if (GetArg(args, "--protection-probe") is { } probe) return ProtectionProbe.Run(probe, args).GetAwaiter().GetResult();
         if (GetArg(args, "--visual-probe") is { } visual) return ProtectionVisualProbe.Run(visual);
         if (GetArg(args, "--fast-visual-probe") is { } fastVisual) return FastVisualProbe.Run(fastVisual);
+        if (GetArg(args, "--temporary-visual-probe") is { } temporaryVisual) return TemporaryVisualProbe.Run(temporaryVisual);
         if (GetArg(args, "--return-demo") is { } demoControl) return ReturnProbe.Demo(demoControl);
         if (GetArg(args, "--return-probe") is { } returns) return ReturnProbe.Run(returns, GetArg(args,"--enforcer")!);
         if (GetArg(args, "--background-probe") is { } background) return BackgroundProbe.Run(background, GetArg(args,"--enforcer")!);

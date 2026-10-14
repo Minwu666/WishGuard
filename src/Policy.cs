@@ -19,6 +19,9 @@ public sealed class GuardState
     public long LastSeen { get; set; }
     public string Nonce { get; set; } = NewNonce();
     public string? PermanentPass { get; set; }
+    public string? TemporaryPass { get; set; }
+    public long? TemporaryActivatedAt { get; set; }
+    public long? TemporaryUntil { get; set; }
     public ResourceSnapshot? Resources { get; set; }
     public List<string> UsedPasses { get; set; } = new();
     public static string NewNonce() => Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
@@ -29,10 +32,12 @@ public sealed record ApprovalRequest(string Version, string InstallId, string Po
     int TargetPulls, string UnlockMode, long Primogems, long Intertwined, long ClaimedPulls,
     long ObservedAt, long RequestedAt, string Note);
 public sealed record Grant(string Version, string InstallId, string PolicyId, string Nonce, string Id,
-    long IssuedAt, long RedeemBefore, long VerifiedPulls, string UnlockMode);
+    long IssuedAt, long RedeemBefore, long VerifiedPulls, string UnlockMode,
+    long DurationSeconds = 0, string ApprovalReason = "");
 public sealed record Envelope(string Payload, string Signature);
 public static class Rules
 {
+    public const int TemporaryDurationSeconds = 1800;
     public static long Pulls(long primogems, long intertwined)
     {
         if (primogems < 0 || intertwined < 0 || primogems > 100_000_000 || intertwined > 1_000_000)
@@ -42,6 +47,12 @@ public static class Rules
     public static byte[] Decode(string s) => Convert.FromBase64String(s.Replace('-', '+').Replace('_', '/') + new string('=', (4 - s.Length % 4) % 4));
     public static string Encode(byte[] b) => Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
     public static Grant Validate(string token, string publicKey, GuardState s, long now, bool importing)
+        => ValidateGrant(token, publicKey, s, now, importing, "permanent");
+    public static Grant ValidateTemporary(string token, string publicKey, GuardState s, long now, bool importing)
+        => ValidateGrant(token, publicKey, s, now, importing, "temporary");
+    public static Grant ValidateForImport(string token, string publicKey, GuardState s, long now)
+        => ValidateGrant(token, publicKey, s, now, true, null);
+    static Grant ValidateGrant(string token, string publicKey, GuardState s, long now, bool importing, string? mode)
     {
         if (token.Length > 16000) throw new InvalidDataException("凭证太长。");
         var e = JsonSerializer.Deserialize<Envelope>(token) ?? throw new InvalidDataException("无效凭证。");
@@ -50,14 +61,43 @@ public static class Rules
         if (!key.VerifyData(payload, signature, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence))
             throw new InvalidDataException("凭证签名无效。");
         var g = JsonSerializer.Deserialize<Grant>(payload) ?? throw new InvalidDataException("凭证内容无效。");
-        if (g.Version != "wishguard-v2" || g.UnlockMode != "permanent" || g.InstallId != s.InstallId ||
-            g.PolicyId != s.PolicyId || g.Nonce != s.Nonce || !s.Committed || g.VerifiedPulls < 600 || string.IsNullOrWhiteSpace(g.Id))
-            throw new InvalidDataException("凭证不符合这份 600 抽永久解除计划。");
-        if (g.RedeemBefore <= g.IssuedAt || g.RedeemBefore - g.IssuedAt > 7 * 86400)
+        if (g.Version != "wishguard-v2" || g.InstallId != s.InstallId ||
+            g.PolicyId != s.PolicyId || g.Nonce != s.Nonce || !s.Committed || string.IsNullOrWhiteSpace(g.Id) ||
+            mode != null && g.UnlockMode != mode)
+            throw new InvalidDataException("凭证不属于这份守护计划，或凭证类型不匹配。");
+        bool temporary = g.UnlockMode == "temporary";
+        if (temporary ? g.VerifiedPulls != 0 || g.DurationSeconds != TemporaryDurationSeconds ||
+                string.IsNullOrWhiteSpace(g.ApprovalReason) || g.ApprovalReason.Length > 500 :
+                g.UnlockMode != "permanent" || g.VerifiedPulls < 600 || g.DurationSeconds != 0)
+            throw new InvalidDataException("凭证的解除条件或临时放行时长无效。");
+        if (g.IssuedAt <= 0 || g.RedeemBefore <= g.IssuedAt ||
+            g.RedeemBefore - g.IssuedAt > (temporary ? 86400 : 7 * 86400))
             throw new InvalidDataException("凭证的导入期限无效。");
         if (importing && (g.IssuedAt > now + 60 || now >= g.RedeemBefore || s.UsedPasses.Contains(g.Id)))
             throw new InvalidDataException("凭证未生效、已过导入期限或已使用。");
         return g;
+    }
+    public static Grant ActivateTemporary(GuardState s, string token, string publicKey, long now)
+    {
+        if (now < s.LastSeen || Ended(s, publicKey)) throw new InvalidDataException("记录时间异常或计划已结束，暂不能临时放行。");
+        if (TemporaryActive(s, publicKey, now)) throw new InvalidDataException("当前临时放行尚未结束，不能叠加或重新计时。");
+        var grant = ValidateTemporary(token, publicKey, s, now, true);
+        long until = checked(now + grant.DurationSeconds);
+        s.TemporaryPass = token; s.TemporaryActivatedAt = now; s.TemporaryUntil = until;
+        s.UsedPasses.Add(grant.Id); s.LastSeen = Math.Max(s.LastSeen, now);
+        return grant;
+    }
+    public static bool TemporaryActive(GuardState s, string publicKey, long now)
+    {
+        if (s.TemporaryPass == null || s.TemporaryActivatedAt is not { } at || s.TemporaryUntil is not { } until ||
+            at <= 0 || now < at || now < s.LastSeen || now >= until || s.RecoveryFinished || Permanent(s, publicKey)) return false;
+        try
+        {
+            var grant = ValidateTemporary(s.TemporaryPass, publicKey, s, now, false);
+            return at >= grant.IssuedAt - 60 && at < grant.RedeemBefore &&
+                until == checked(at + grant.DurationSeconds) && s.UsedPasses.Contains(grant.Id);
+        }
+        catch { return false; }
     }
     public static bool Permanent(GuardState s, string publicKey)
     {
@@ -119,7 +159,16 @@ public sealed class StateStore
         if (Fault) throw new IOException(FaultMessage);
         string temp = path + ".tmp";
         File.WriteAllText(temp, JsonSerializer.Serialize(State, new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
-        File.Move(temp, path, true); File.WriteAllText(Path.Combine(DirectoryPath, "initialized"), "1");
+        string initialized = Path.Combine(DirectoryPath, "initialized");
+        if (!File.Exists(initialized)) File.WriteAllText(initialized, "1");
+        File.Move(temp, path, true);
+    }
+    public void Commit(Action<GuardState> change)
+    {
+        if (Fault) throw new IOException(FaultMessage);
+        string previous = JsonSerializer.Serialize(State);
+        try { change(State); Save(); }
+        catch { State = JsonSerializer.Deserialize<GuardState>(previous)!; throw; }
     }
     public void Log(string type, string detail)
     {

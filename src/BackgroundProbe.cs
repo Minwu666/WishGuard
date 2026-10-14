@@ -65,6 +65,7 @@ internal static class BackgroundProbe
         using var guard = new GuardController(store, "") { Strong = true }; guard.UseInputBroker(profile);
         Process? game = null, broker = null; nint gameWindow = 0;
         bool foregroundRequestAccepted = false;
+        object? finalNormalSample = null;
         int exit = 1; var checks = new List<object>();
 
         Process Start(string exe, params string[] args)
@@ -113,6 +114,7 @@ internal static class BackgroundProbe
                 guard.Status,
                 guard.EnforcementDiagnostic,
                 guard.DebugForTest,
+                finalNormalSample,
                 demoState = ReadDemoState()
             }, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -219,8 +221,14 @@ internal static class BackgroundProbe
                     await Check("round " + round + " normal play resumes after the wish scene",
                         NormalReleased);
                 }
-                await Hold("final normal game stays running, foreground and clear",
-                    () => Alive() && !IsIconic(gameWindow) && !guard.CoverVisibleForTest && Native.GetForegroundWindow() == gameWindow && Scene(false), 1000);
+                await Hold("final normal game stays running, foreground and clear", () =>
+                {
+                    bool alive = Alive(), minimized = IsIconic(gameWindow), covered = guard.CoverVisibleForTest;
+                    nint foreground = Native.GetForegroundWindow(); var state = ReadDemoState();
+                    finalNormalSample = new { alive, minimized, covered, foreground = (long)foreground,
+                        expectedForeground = (long)gameWindow, stateAvailable = state != null, state?.Wish, state?.Attempts };
+                    return alive && !minimized && !covered && foreground == gameWindow && state is { Wish: false, Attempts: 0 };
+                }, 1000);
                 exit = 0;
             }
             catch (Exception e) { checks.Add(new { name = "background integration", pass = false, error = e.ToString() }); }

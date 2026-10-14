@@ -9,7 +9,7 @@ public sealed class MainForm : Form
     readonly StateStore store; readonly string publicKey; readonly RuntimeOptions options;
     readonly GuardController guard; readonly ScenePanel scene = new();
     readonly List<(Control Control, Rectangle Bounds, int Tab)> items = new();
-    readonly Button home, settings, help, primary, import, askRecovery, cancelRecovery, finishRecovery, retry;
+    readonly Button home, settings, help, primary, import, temporaryRequest, askRecovery, cancelRecovery, finishRecovery, retry;
     readonly CheckBox bindGame = new();
     readonly NotifyIcon tray;
     readonly System.Windows.Forms.Timer pulse = new() { Interval = 1000 };
@@ -42,7 +42,8 @@ public sealed class MainForm : Form
         settings = AddButton("守护设置", new(22, 204, 158, 44), -1, () => Switch(1));
         help = AddButton("识别与帮助", new(22, 262, 158, 44), -1, () => Switch(2));
         primary = AddButton("开启 600 抽守护", new(252, 595, 245, 46), 0, async () => { if (!store.State.Committed) await Enroll(); else ExportRequest(); }, true);
-        import = AddButton("导入永久解除凭证", new(518, 595, 239, 46), 0, async () => await ImportPass());
+        import = AddButton("导入解除／临时凭证", new(518, 595, 239, 46), 0, async () => await ImportPass());
+        temporaryRequest = AddButton("申请 30 分钟临时放行", new(778, 595, 230, 46), 0, () => ExportRequest(true));
         askRecovery = AddButton("申请 24 小时冷静期", new(252, 420, 235, 44), 1, async () => await RequestRecovery());
         cancelRecovery = AddButton("撤销申请，继续守护", new(510, 420, 254, 44), 1, async () => await CancelRecovery());
         finishRecovery = AddButton("冷静期已结束，停止守护", new(252, 481, 285, 44), 1, async () => await FinishRecovery(), true);
@@ -146,10 +147,16 @@ public sealed class MainForm : Form
     {
         var s = store.State;
         bool changed = s.RecoveryAt != reply.RecoveryAt || s.RecoveryRequestedAt != reply.RecoveryRequestedAt ||
-            s.RecoveryFinished != reply.RecoveryFinished || s.PermanentPass != reply.PermanentPass;
+            s.RecoveryFinished != reply.RecoveryFinished || s.PermanentPass != reply.PermanentPass ||
+            s.TemporaryPass != reply.TemporaryPass || s.TemporaryActivatedAt != reply.TemporaryActivatedAt || s.TemporaryUntil != reply.TemporaryUntil ||
+            reply.UsedPasses != null && !s.UsedPasses.SequenceEqual(reply.UsedPasses);
         s.RecoveryAt = reply.RecoveryAt; s.RecoveryRequestedAt = reply.RecoveryRequestedAt;
         s.RecoveryFinished = reply.RecoveryFinished; s.PermanentPass = reply.PermanentPass;
+        s.TemporaryPass = reply.TemporaryPass; s.TemporaryActivatedAt = reply.TemporaryActivatedAt; s.TemporaryUntil = reply.TemporaryUntil;
+        if (reply.UsedPasses != null) s.UsedPasses = new(reply.UsedPasses);
+        s.LastSeen = Math.Max(s.LastSeen, reply.LastSeen);
         if (changed) store.Save();
+        guard.RefreshTemporary();
         if (reply.Completed) { protectionPulse.Stop(); guard.Stop("计划已经结束。"); DisableWatcher(); }
     }
     void OpenDemo()
@@ -223,6 +230,7 @@ public sealed class MainForm : Form
         primary.AccessibleName = primary.Text;
         primary.Enabled = !Ended && !store.Fault && !starting && (!store.State.Committed || store.State.Resources?.Pulls >= 600);
         import.Enabled = store.State.Committed && !Ended && !store.Fault;
+        temporaryRequest.Enabled = store.State.Committed && !Ended && !store.Fault && !guard.TemporaryActive;
         bindGame.Enabled = !store.State.Committed && !Ended;
         askRecovery.Enabled = store.State.Committed && !Ended && !store.Fault && store.State.RecoveryAt == null;
         cancelRecovery.Enabled = store.State.Committed && !Ended && !store.Fault && store.State.RecoveryAt != null;
@@ -235,29 +243,57 @@ public sealed class MainForm : Form
         tray.Text = Ended ? "攒愿 · 计划已结束" : "攒愿 · " + guard.Phase;
         scene.Invalidate();
     }
-    void ExportRequest()
+    void ExportRequest(bool temporary = false)
     {
-        if (store.State.Resources is not { } r || r.Pulls < 600 || Ended || store.Fault) return;
-        using var dialog = new SaveFileDialog { Filter = "核验申请 (*.json)|*.json", FileName = "攒愿-600抽永久解除申请.json" };
+        if (Ended || store.Fault || !store.State.Committed || temporary && guard.TemporaryActive) return;
+        var r = store.State.Resources;
+        if (!temporary && (r == null || r.Pulls < 600)) return;
+        string note = "本地 OCR 读数，尚未由签发者核验。请同时提供当前资源截图，可遮住 UID。";
+        if (temporary)
+        {
+            using var reason = new Form { Text = "申请一次性临时放行", ClientSize = new(580, 230), FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, Font = Font };
+            var label = new Label { Text = "想抽的角色与申请理由（由核验人决定是否批准）", AutoSize = true, Location = new(20, 20) };
+            var input = new TextBox { Multiline = true, MaxLength = 500, Bounds = new(20, 58, 540, 102) };
+            var submit = new Button { Text = "导出申请", DialogResult = DialogResult.OK, Bounds = new(330, 181, 110, 34) };
+            var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Bounds = new(450, 181, 110, 34) };
+            reason.Controls.AddRange([label, input, submit, cancel]); reason.AcceptButton = submit; reason.CancelButton = cancel;
+            if (reason.ShowDialog(this) != DialogResult.OK) return;
+            note = input.Text.Trim();
+            if (note.Length == 0) { message = "请填写角色与申请理由，再导出临时申请。"; RefreshScene(); return; }
+        }
+        using var dialog = new SaveFileDialog { Filter = "核验申请 (*.json)|*.json", FileName = temporary ? "攒愿-30分钟临时放行申请.json" : "攒愿-600抽永久解除申请.json" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         try
         {
             var s = store.State;
-            var request = new ApprovalRequest("wishguard-v2", s.InstallId, s.PolicyId, s.Nonce, 600, "permanent", r.Primogems, r.Intertwined,
-                r.Pulls, r.ObservedAt, guard.Now, "本地 OCR 读数，尚未由签发者核验。请同时提供当前资源截图，可遮住 UID。");
+            var request = new ApprovalRequest("wishguard-v2", s.InstallId, s.PolicyId, s.Nonce, 600, "permanent", r?.Primogems ?? 0, r?.Intertwined ?? 0,
+                r?.Pulls ?? 0, r?.ObservedAt ?? 0, guard.Now, note);
             File.WriteAllText(dialog.FileName, JsonSerializer.Serialize(request, new JsonSerializerOptions { WriteIndented = true }));
-            message = "申请已导出。将申请和当前资源截图交给你配置的可信核验人，核验后导入永久解除凭证。"; RefreshScene();
+            message = temporary ? "临时申请已导出。核验人批准后签发一次性 30 分钟凭证，导入即开始计时。" :
+                "申请已导出。将申请和当前资源截图交给你配置的可信核验人，核验后导入永久解除凭证。"; RefreshScene();
         }
         catch (Exception e) { message = e.Message; RefreshScene(); }
     }
     async Task ImportPass()
     {
-        using var dialog = new OpenFileDialog { Filter = "永久解除凭证 (*.wishpass)|*.wishpass" };
+        using var dialog = new OpenFileDialog { Filter = "解除凭证 (*.wishpass)|*.wishpass", Title = "导入凭证（临时凭证激活后连续计时）" };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
         try
         {
             if (new FileInfo(dialog.FileName).Length > 16000) throw new InvalidDataException("文件不是有效凭证。");
             string token = File.ReadAllText(dialog.FileName);
+            var grant = Rules.ValidateForImport(token, publicKey, store.State, guard.Now);
+            if (grant.UnlockMode == "temporary")
+            {
+                if (guard.TemporaryActive) throw new InvalidOperationException("当前临时放行尚未结束，不能叠加或重新计时。");
+                if (MessageBox.Show(this, "审批理由：" + grant.ApprovalReason + "\n\n激活后连续放行 30 分钟，不能暂停或重新使用；到期恢复原来的 600 抽计划。现在激活？",
+                    "激活一次性临时凭证", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes) return;
+                if (enforcement != null) ApplyProtection(await enforcement.Send("temporary-unlock", token: token));
+                else guard.ImportTemporary(token);
+                message = "临时凭证已激活，30 分钟后自动恢复守护。";
+                RefreshScene(); return;
+            }
             if (enforcement != null) ApplyProtection(await enforcement.Send("unlock", token: token));
             else guard.Import(token);
             DisableWatcher();
@@ -330,7 +366,7 @@ public sealed class MainForm : Form
         ScenePanel.DrawText(g, options.Demo ? "模拟演示 / 不影响原神" : enforcement != null ? "强制模式 / 本机识别" : "本机识别 / 无需登录", 25, 674, 11, ScenePanel.Muted);
         string title = tab == 0 ? "把期待，留给值得的相遇。" : tab == 1 ? "按自己的节奏，继续。" : "看得见的守护状态。";
         ScenePanel.DrawText(g, title, 234, 34, 29, ScenePanel.White, true);
-        string phase = Ended ? "计划已结束" : !store.State.Committed ? "准备开始" : guard.Phase;
+        string phase = Ended ? "计划已结束" : guard.TemporaryActive ? "临时放行" : !store.State.Committed ? "准备开始" : guard.Phase;
         ScenePanel.Round(g, new(851, 35, 175, 37), ScenePanel.Card, 18);
         ScenePanel.DrawText(g, "●  " + phase, 867, 45, 12, guard.Phase == "保护不可用" ? ScenePanel.Warn : ScenePanel.Gold);
         ScenePanel.DrawText(g, message ?? (store.Fault ? store.FaultMessage : Ended ? "自动启动和识别已经停止。" : guard.Status), 236, 87, 13,
@@ -355,7 +391,11 @@ public sealed class MainForm : Form
         ScenePanel.DrawText(g, "纠缠之缘", 663, 427, 14, ScenePanel.Muted); ScenePanel.DrawText(g, r?.Intertwined.ToString("N0") ?? "—", 661, 458, 35, ScenePanel.White, true);
         ScenePanel.DrawText(g, "只计限定祈愿资源", 663, 509, 12, ScenePanel.Muted);
         ScenePanel.DrawText(g, r == null ? guard.ResourceStatus : $"上次识别 {DateTimeOffset.FromUnixTimeSeconds(r.ObservedAt).ToOffset(TimeSpan.FromHours(8)):MM-dd HH:mm:ss}  ·  {guard.ResourceStatus}", 252, 557, 12, ScenePanel.Muted, false, 750, 29);
-        ScenePanel.DrawText(g, !store.State.Committed ? "启用即采用 600 抽永久解除计划；仅支持简体中文、键鼠和窗口化／无边框。" : "达到 600 抽后由可信核验人核验；凭证生效后永久解除，并移除自动启动。", 252, 657, 12, ScenePanel.Muted, false, 740, 50);
+        long seconds = guard.TemporaryRemaining;
+        string footer = seconds > 0 ? $"临时放行剩余 {seconds / 60:00}:{seconds % 60:00} · 连续计时，不暂停；到期继续 600 抽计划。" :
+            !store.State.Committed ? "启用即采用 600 抽永久解除计划；仅支持简体中文、键鼠和窗口化／无边框。" :
+            "600 抽达标核验后永久解除；临时凭证只放行 30 分钟，不改变计划。";
+        ScenePanel.DrawText(g, footer, 252, 657, 12, seconds > 0 ? ScenePanel.Gold : ScenePanel.Muted, false, 750, 50);
     }
     void PaintSettings(Graphics g)
     {

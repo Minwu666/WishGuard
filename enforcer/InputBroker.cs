@@ -37,7 +37,14 @@ internal static class InputBroker
         long traceWritten = -1;
 #endif
         if (!await keys.Started.WaitAsync(TimeSpan.FromSeconds(3))) return 4;
-        bool Completed() => EnforcementPaths.Read(file).Completed;
+        // Read only the protected authority file; the client's writable mirror
+        // cannot authorize input. Keep a monotonic floor within this process.
+        var clock = Stopwatch.StartNew();
+        long startWall = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), highWaterNow = startWall;
+        long Now() => highWaterNow = Math.Max(highWaterNow,
+            Math.Max(DateTimeOffset.UtcNow.ToUnixTimeSeconds(), startWall + clock.ElapsedMilliseconds / 1000));
+        EnforcementProfile authority = profile;
+        bool Completed() { authority = EnforcementPaths.Read(file); return authority.Completed; }
         while (!Completed())
         {
             try
@@ -62,7 +69,7 @@ internal static class InputBroker
                     uint coverThread = GetWindowThreadProcessId(cover, out int owner);
                     if (request[8] == 1 && owner == client && coverThread != 0 && IsWindowVisible(cover))
                     {
-                        protectedKeys = target && keys.Ready;
+                        protectedKeys = target && keys.Ready && !Rules.TemporaryActive(authority.Policy, profile.PublicKey, Now());
                     }
                     keys.Configure(target ? fg : 0, game, cover, client, protectedKeys);
                     byte[] response = new byte[17]; BinaryPrimitives.WriteInt64LittleEndian(response, keys.Entry); response[8] = protectedKeys ? (byte)1 : (byte)0;

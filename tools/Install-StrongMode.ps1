@@ -10,7 +10,7 @@ param(
     [string]$ReportPath
 )
 $ErrorActionPreference = 'Stop'
-$result = [ordered]@{ Success = $false; Version = '0.3.2'; PolicyPreserved = $false }
+$result = [ordered]@{ Success = $false; Version = '0.4.0'; PolicyPreserved = $false }
 $changed = $false; $oldTasks = @{}; $oldService = $null; $serviceChanged = $false
 function Is-MissingTask($record) {
     $error = $record.Exception
@@ -56,7 +56,7 @@ try {
     }
     $id = Get-Key $OwnerSid
     $accountRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) ('WishGuard\' + $id)
-    $programRoot = Join-Path $accountRoot ('0.3.2-' + [Guid]::NewGuid().ToString('N'))
+    $programRoot = Join-Path $accountRoot ('0.4.0-' + [Guid]::NewGuid().ToString('N'))
     $client = Join-Path $programRoot 'Client'
     $enforcer = Join-Path $programRoot 'Enforcer'
     $policyDir = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('WishGuard\Strong\' + $id)
@@ -126,7 +126,7 @@ try {
     foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='WishGuard.exe' OR Name='WishGuard.Enforcer.exe'" | Where-Object { $_.ExecutablePath -in $allowed })) {
         Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    $backup = Join-Path $InstallDirectory ('backup\before-0.3.2-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $backup = Join-Path $InstallDirectory ('backup\before-0.4.0-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
     foreach ($name in $clientFiles) { $path = Join-Path $InstallDirectory $name; if (Test-Path -LiteralPath $path) { Copy-Item -LiteralPath $path -Destination (Join-Path $backup $name) } }
     function Protect-Directory([string]$path) {
@@ -219,7 +219,7 @@ try {
     if ((Get-WishGuardService $protectionService).State -ne 'Running' -or $folder.GetTask($watchTask).State -ne 4 -or $folder.GetTask($inputTask).State -ne 4) { throw 'Installed protection did not remain running.' }
     if ((Get-FileHash -LiteralPath $keyFile).Hash -ne $keyHash) { throw 'Public key changed unexpectedly.' }
     $after = Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    foreach ($field in @('InstallId','Nonce','TargetPulls','UnlockMode','Committed','RecoveryAt','RecoveryRequestedAt','PermanentPass','RecoveryFinished')) {
+    foreach ($field in @('InstallId','Nonce','TargetPulls','UnlockMode','Committed','RecoveryAt','RecoveryRequestedAt','PermanentPass','RecoveryFinished','TemporaryPass','TemporaryActivatedAt','TemporaryUntil')) {
         if ($after.$field -cne $state.$field) { throw ('Plan changed unexpectedly: ' + $field) }
     }
     $result.Success = $true; $result.PolicyPreserved = $true

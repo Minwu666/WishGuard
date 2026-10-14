@@ -39,7 +39,7 @@ def initialize(private_dir, public_output):
     return private_file
 
 
-def make_grant(request, primogems, intertwined, now):
+def request_binding(request):
     require(request.get("Version") == "wishguard-v2", "Unsupported request version.")
     require(request.get("TargetPulls") == 600 and request.get("UnlockMode") == "permanent",
             "This deployment requires 600 pulls and permanent release.")
@@ -51,6 +51,11 @@ def make_grant(request, primogems, intertwined, now):
         f"wishguard-v2|{install}|600|intertwined+floor(primogems/160)|permanent".encode()
     ).hexdigest().upper()
     require(request.get("PolicyId") == policy, "Policy does not match the installation.")
+    return install, policy, nonce
+
+
+def make_grant(request, primogems, intertwined, now):
+    install, policy, nonce = request_binding(request)
     require(type(primogems) is int and 0 <= primogems <= 100_000_000, "Invalid primogem count.")
     require(type(intertwined) is int and 0 <= intertwined <= 1_000_000, "Invalid intertwined count.")
     total = intertwined + primogems // 160
@@ -64,6 +69,22 @@ def make_grant(request, primogems, intertwined, now):
     return {"Version": "wishguard-v2", "UnlockMode": "permanent", "InstallId": install,
             "PolicyId": policy, "Nonce": nonce, "Id": uuid.uuid4().hex, "IssuedAt": now,
             "RedeemBefore": now + 7 * 86400, "VerifiedPulls": total}
+
+
+def make_temporary_grant(request, reason, now):
+    install, policy, nonce = request_binding(request)
+    stamp = request.get("RequestedAt")
+    require(type(stamp) is int and now - 86400 <= stamp <= now + 60,
+            "RequestedAt is stale or has an invalid clock value.")
+    require(isinstance(reason, str), "An explicit reviewer approval reason is required.")
+    reason = reason.strip()
+    # Match the client's UTF-16 string limit, including non-BMP characters.
+    require(1 <= len(reason.encode("utf-16-le")) // 2 <= 500,
+            "Reviewer approval reason must contain 1 to 500 characters after trimming.")
+    return {"Version": "wishguard-v2", "UnlockMode": "temporary", "InstallId": install,
+            "PolicyId": policy, "Nonce": nonce, "Id": uuid.uuid4().hex, "IssuedAt": now,
+            "RedeemBefore": now + 86400, "VerifiedPulls": 0, "DurationSeconds": 1800,
+            "ApprovalReason": reason}
 
 
 def sign(grant, key_file):
@@ -90,6 +111,12 @@ def main():
     issue.add_argument("--evidence", type=Path, required=True)
     issue.add_argument("--reviewed", action="store_true", required=True)
     issue.add_argument("--output", type=Path, required=True)
+    temporary = commands.add_parser("issue-temporary", help="Approve one 30-minute exception; the 600-pull plan remains active.")
+    temporary.add_argument("--key", type=Path, required=True)
+    temporary.add_argument("--request", type=Path, required=True)
+    temporary.add_argument("--reviewed", action="store_true", required=True)
+    temporary.add_argument("--reason", required=True)
+    temporary.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "init":
@@ -97,15 +124,21 @@ def main():
             print(f"Public key: {args.public_output}\nKeep private: {private_file}")
             return
         require(args.request.stat().st_size <= 16000, "Request file is too large.")
-        require(args.evidence.is_file() and args.evidence.stat().st_size > 0, "Current evidence file is required.")
+        if args.command == "issue":
+            require(args.evidence.is_file() and args.evidence.stat().st_size > 0, "Current evidence file is required.")
         request = json.loads(args.request.read_text(encoding="utf-8-sig"))
         require(isinstance(request, dict), "Request must be a JSON object.")
-        grant = make_grant(request, args.primogems, args.intertwined, int(time.time()))
+        now = int(time.time())
+        grant = (make_temporary_grant(request, args.reason, now) if args.command == "issue-temporary"
+                 else make_grant(request, args.primogems, args.intertwined, now))
         token = sign(grant, args.key)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x", encoding="utf-8") as file:
             json.dump(token, file, indent=2)
-        print(f"Issued {args.output}; import within seven days. Accepted release is permanent.")
+        if args.command == "issue-temporary":
+            print(f"Issued {args.output}; import within 24 hours. One use; 30 minutes start on import and cannot be paused. The 600-pull plan remains active.")
+        else:
+            print(f"Issued {args.output}; import within seven days. Accepted release is permanent.")
     except (ValueError, OSError, TypeError) as error:
         parser.exit(1, f"Cannot proceed: {error}\n")
 
